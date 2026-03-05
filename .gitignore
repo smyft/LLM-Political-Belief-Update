@@ -1,0 +1,18 @@
+# Ignore everything by default (allowlist strategy)
+*
+
+# Keep repository essentials
+!.gitignore
+!README.md
+!requirements.txt
+!data/
+!data/**
+!src/
+!src/**
+
+# Ignore generated/system artifacts inside allowed paths
+**/.DS_Store
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
