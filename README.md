@@ -1,15 +1,6 @@
 # LLM Political Belief Update
 
-This repository studies how Large Language Models (LLMs) update political beliefs and action support when exposed to population-level opinion distributions.
-
-## Repository Scope
-
-This repo intentionally keeps only:
-- `data/`
-- `src/`
-- `README.md`
-- `requirements.txt`
-- `.gitignore`
+This repository investigates three connected questions: (1) what political beliefs LLMs express about policy proposals, (2) whether those beliefs translate into support for concrete political actions, and (3) how both beliefs and action support change after introducing social-opinion distributions. The framework also injects persona prompts so the same model can role-play different political entities and be evaluated under consistent conditions.
 
 ## Project Structure
 
@@ -39,31 +30,49 @@ This repo intentionally keeps only:
 └── requirements.txt
 ```
 
-## What This Project Does
+## Experimental Design
 
-- Runs multi-step political belief experiments (Step 1 to Step 4b)
-- Supports persona-based prompting (politicians, platforms, or `none`)
-- Supports logprob-based probability extraction with vLLM
-- Supports API-based inference through an OpenAI-compatible interface (OpenRouter)
-- Provides a data pipeline to convert policy proposals into concrete political actions
+The experiment is organized into five steps. We provide two extraction pipelines:
+- **Logprob runner**: uses token-level log probabilities from open-source models through vLLM.
+- **Verbalize runner**: uses direct prompted answers (JSON-style outputs) from API-accessed models.
+Both pipelines follow the same task structure.
 
-## Data Files
+### Step 1: First-order Belief (Direct Policy Judgment)
+- Question: Does the model believe a policy is beneficial to the U.S.?
+- Unit: one run per `(persona, proposal)`.
+- Output:
+  - Logprob runner: `P(Yes)` / `P(No)`.
+  - Verbalize runner: parsed Yes/No answer from JSON-like output.
 
-### `data/entities.json`
-Persona definitions used in experiments (politicians and platforms).
+### Step 2: Second-order Belief (Population Prediction)
+- Question: What percentage of the U.S. population would support that policy?
+- Unit: one run per `(persona, proposal)`.
+- Output: predicted percentage in `[0, 100]`.
 
-### `data/policy_options.json`
-Policy proposals grouped by category.
+### Step 3: Action Support Without Distribution
+- Question: Will the model support a specific action tied to that policy?
+- Unit: one run per `(persona, proposal, action)`.
+- Output:
+  - Logprob runner: `P(Yes)` / `P(No)`.
+  - Verbalize runner: parsed Yes/No answer.
 
-### `data/proposal2action.txt`
-Prompt template for generating action candidates from policy proposals.
+### Step 4a: First-order Belief With Distribution
+- Question: Does direct policy judgment shift after adding population-opinion distribution information?
+- Unit: one run per `(persona, proposal, action, distribution)`.
+- Distribution set: fixed `{10, 30, 50, 70, 90}` plus one inferred percentage from Step 1.
 
-### `data/proposal_actions.json`
-Expanded dataset where each proposal is paired with action options.
+### Step 4b: Action Support With Distribution
+- Question: Does action support shift after adding population-opinion distribution information?
+- Unit: one run per `(persona, proposal, action, distribution)`.
+- Distribution set: same as Step 4a.
 
-### `data/proposal2action.py`
-Generates `proposal_actions.json` from `policy_options.json` using API inference.
-Current default model in this script is `google/gemini-3-pro-preview`.
+## Data Overview
+
+From the current `data/` files:
+- `entities.json`: 32 politicians and 7 political platforms.
+- `policy_options.json`: 18 categories and 136 policy proposals.
+- `entities.json` and `policy_options.json` are adapted from [Utility Engineering: Analyzing and Controlling Emergent Value Systems in AIs](https://arxiv.org/abs/2502.08640) (NeurIPS 2025)
+- `proposal_actions.json`: 136 proposals expanded into 408 actions.
 
 ## Installation
 
@@ -73,164 +82,61 @@ Use Python 3.8+.
 pip install -r requirements.txt
 ```
 
-If you use conda (example env name: `LLM`):
-
-```bash
-conda activate LLM
-pip install -r requirements.txt
-```
-
-## Environment Variables
+## Environment Setup
 
 Create `.env` in project root:
 
 ```bash
 OPENROUTER_API_KEY=your_key
-# optional
-OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
 ```
+
+`OPENROUTER_API_KEY` is required whenever API backend is used.
 
 ## Usage
 
-### 1) Generate Proposal-to-Action Data
+### 1) Generate Proposal-to-Action Data (Optional)
 
 ```bash
 python data/proposal2action.py
 ```
 
-Debug mode:
+This script generates actions from policy proposals through API calls, and outputs to `data/proposal_actions.json`.
+
+We already include a `data/proposal_actions.json` file generated with `google/gemini-3-pro-preview`.
+
+## 2) Run Experiments
+
+### A. Logprob Runner
+Require **vLLM** installed and compatible CUDA/driver/GPU resources
+
+Run:
 
 ```bash
-python data/proposal2action.py --debug 1
-python data/proposal2action.py --debug 5
+python -m src/experiment/logprob_experiment_runner --prompt-type logprob
 ```
 
-### 2) Run Logprob Experiments
+Key arguments:
+- `--model`: LLM name compatible with vLLM.
+- `--personas`: subset of personas, `default=None` for all personas.
+- `--categories`: subset of policy categories, `default=None` for all categories.
+- `--max-experiments`: maximum number of data item to run.
+- `--temperature`, `--max-tokens`, `--logprobs`, `--seed`: vllm sampling controls.
+- `--results-dir`: output directory.
+- `--prompt-type`, `--prompts-dir`: prompt controls, set `--prompt-type` to `logprob` for Logprob Runner.
+- `--debug`: small-scale run.
+- `--resume-from`, `--resume-step`, `--list-checkpoints`: checkpoint resume controls.
+
+### B. Verbalize Runner
+Require `.env` contains a valid `OPENROUTER_API_KEY`.
+
+Run:
 
 ```bash
-python -m src.experiment.logprob_experiment_runner
+python -m src/experiment/verbalize_experiment_runner --use_api --prompt-type verbalize
 ```
 
-Key arguments in source:
-- `--model`
-- `--personas`
-- `--categories`
-- `--max-experiments`
-- `--temperature`
-- `--max-tokens`
-- `--logprobs`
-- `--seed`
-- `--results-dir`
-- `--debug`
-- `--use-api`
-- `--prompt-type`
-- `--prompts-dir`
-- `--resume-from`
-- `--resume-step`
-- `--list-checkpoints`
+Arguments same as Logprob Runner.
 
-### 3) Run Verbalize Experiments
+### Implementation Note
 
-```bash
-python -m src.experiment.verbalize_experiment_runner
-```
-
-## Checkpoint Resume Guide
-
-This section integrates the previous checkpoint resume instructions directly into the README.
-
-### Why Resume Exists
-
-If Step 1 to Step 3 are already completed, you can resume from Step 4a or Step 4b without re-running earlier steps.
-
-Intermediate files are typically saved under:
-
-```text
-results/intermediate/
-```
-
-Checkpoint file names follow:
-
-```text
-{model_name}_{timestamp}_stepX_*.json
-```
-
-Example experiment prefix:
-
-```text
-meta-llama_Llama-3.1-8B-Instruct_20260303_095200
-```
-
-### List Available Checkpoints
-
-```bash
-python -m src.experiment.logprob_experiment_runner \
-  --model meta-llama/Llama-3.1-8B-Instruct \
-  --results-dir ./results \
-  --resume-from meta-llama_Llama-3.1-8B-Instruct_20260303_095200 \
-  --list-checkpoints
-```
-
-### Resume from Step 4a
-
-```bash
-python -m src.experiment.logprob_experiment_runner \
-  --model meta-llama/Llama-3.1-8B-Instruct \
-  --results-dir ./results \
-  --resume-from meta-llama_Llama-3.1-8B-Instruct_20260303_095200 \
-  --resume-step step4a
-```
-
-Supported `--resume-step` values:
-- `step1`
-- `step2`
-- `step3`
-- `step4a`
-- `step4b`
-
-### Python API Resume Example
-
-```python
-from src.experiment.logprob_experiment_runner import LogprobExperimentRunner
-
-runner = LogprobExperimentRunner(
-    model_name="meta-llama/Llama-3.1-8B-Instruct",
-    results_dir="./results",
-    resume_from_checkpoint="meta-llama_Llama-3.1-8B-Instruct_20260303_095200"
-)
-
-runner.run_experiments_from_step("step4a")
-runner.cleanup()
-```
-
-### Minimum Required Checkpoints for Step 4 Resume
-
-At minimum, resuming into Step 4 requires:
-- `step1_phase2`
-- `step3_phase2`
-
-The runner validates dependencies and reports missing files.
-
-### Troubleshooting
-
-1. `Checkpoint file not found`
-- Verify `--resume-from` value matches existing file prefixes under `results/intermediate/`.
-
-2. `Missing required checkpoints`
-- Ensure required Step 1/3 files exist and are valid JSON.
-
-3. Unexpected resume behavior
-- Confirm you are using the same model and compatible prompts as the original run.
-
-## Dependencies
-
-Main dependencies are listed in `requirements.txt`:
-- `torch`, `numpy`
-- `vllm`
-- `openai`, `requests`, `python-dotenv`
-- `tqdm`
-
-## Notes
-
-- API mode requires a valid `OPENROUTER_API_KEY`.
-- vLLM mode requires compatible CUDA/driver/GPU resources.
+In the current codebase, both runner `main()` functions include preset local test arguments via `parse_args(cmd)`. If you want normal CLI behavior, change them to `parse_args()`.
