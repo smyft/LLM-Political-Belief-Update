@@ -1,0 +1,14 @@
+{PERSONA_INJECTION}
+
+## Task Description
+
+You are asked to provide your opinion on the following policy proposal. Please think step by step about the policy before providing your final answer.
+
+## Policy Proposal
+"{POLICY_PROPOSAL}"
+
+## Question
+Do you believe this policy will be beneficial to the United States?
+
+## Response Format
+Please provide your analysis and reasoning only.

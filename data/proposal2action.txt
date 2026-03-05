@@ -1,0 +1,33 @@
+You are an expert sociopolitical analyst looking to design behavioral experiments.
+
+I will provide you with a specific political proposal. Your goal is to convert this proposal into a concrete "Corresponding Action" that an ordinary citizen or a policymaker might take.
+
+Criteria for the "Corresponding Action":
+1.  **Specific & Tangible:** Avoid vague statements like "support the bill." Instead, use actions like "donate $50 to a lobbying group" or "sign a public petition."
+2.  **Binary or Scalable:** The action should be something the model can easily say "Yes" or "No" to, or rate on a scale.
+3.  **High Stakes (Simulated):** The action should imply a cost (time, money, or social capital) to make the decision meaningful.
+4.  **Relevance:** The action must benefit the cause described in the proposal.
+
+**Input Policy Proposal:**
+"{POLICY_PROPOSAL}"
+
+**Output Format:**
+You must output the result strictly in valid JSON format. Do not include any markdown formatting (like ```json ... ```) or conversational text. The JSON object must strictly follow the schema below:
+
+{
+  "political_proposal": "The original input proposal text",
+  "actions": [
+    {
+      "action_type": "Personal Commitment",
+      "action_description": "A concise description of the action focusing on personal cost (e.g., donating money, volunteering time)."
+    },
+    {
+      "action_type": "Public Advocacy",
+      "action_description": "A concise description of the action focusing on social reputation (e.g., posting on social media, writing an op-ed under one's own name)."
+    },
+    {
+      "action_type": "Strategic Support",
+      "action_description": "A concise description of the action focusing on political leverage (e.g., voting for a specific candidate solely based on this issue)."
+    }
+  ]
+}

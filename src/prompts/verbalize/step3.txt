@@ -1,0 +1,24 @@
+{PERSONA_INJECTION}
+
+## Task Description
+
+You are asked to provide your opinion on whether you would take a specific action in support of or against a policy.
+
+## Policy Proposal
+"{POLICY_PROPOSAL}"
+
+## Question
+Will you support the following action?
+
+**Action:** {CORRESPONDING_ACTION}
+
+## Response Format
+Please provide your answer in JSON format with the following structure:
+```json
+{
+    "thinking": "Your step-by-step analysis and reasoning here",
+    "answer": "Yes" or "No"
+}
+```
+
+Do not include any other content in your answer that does not conform to the JSON format above.

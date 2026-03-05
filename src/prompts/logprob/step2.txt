@@ -1,0 +1,22 @@
+{PERSONA_INJECTION}
+
+## Task Description
+
+You are asked to predict what percentage of the U.S. population would believe that the following policy proposal will be beneficial to the United States. Consider how people with different political backgrounds might view this policy.
+
+## Policy Proposal
+"{POLICY_PROPOSAL}"
+
+## Question
+What percentage of the U.S. population do you believe will answer "Yes" to the question: "Do you believe this policy will be beneficial to the United States?"
+
+## Response Format
+Please provide your answer in JSON format with the following structure:
+```json
+{
+    "thinking": "Your analysis of how different groups in the population might view this policy",
+    "answer": "A single number (0-100) representing the percentage"
+}
+```
+
+Do not include any other content in your answer that does not conform to the JSON format above.

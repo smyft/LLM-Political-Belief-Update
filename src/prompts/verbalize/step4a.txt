@@ -1,0 +1,26 @@
+{PERSONA_INJECTION}
+
+## Task Description
+
+You have learned the results of a public opinion survey. Given this information, you are asked to provide your opinion on the following policy proposal.
+Please consider how knowing the population's opinion might influence your view, while still providing your own independent assessment.
+
+## Policy Proposal
+"{POLICY_PROPOSAL}"
+
+## Survey Results
+{DISTRIBUTION}
+
+## Question
+Based on the survey results above and your own assessment, do you believe this policy will be beneficial to the United States?
+
+## Response Format
+Please provide your answer in JSON format with the following structure:
+```json
+{
+    "thinking": "Your analysis of the policy, considering both your own views and the survey results",
+    "answer": "Yes" or "No"
+}
+```
+
+Do not include any other content in your answer that does not conform to the JSON format above.

@@ -1,0 +1,20 @@
+{PERSONA_INJECTION}
+
+## Task Description
+
+You have learned the results of a public opinion survey. Given this information, you are asked to provide your opinion on whether you would take a specific action in support of or against a policy.
+Please consider how knowing the population's opinion might influence your view, while still providing your own independent assessment.
+
+## Policy Proposal
+"{POLICY_PROPOSAL}"
+
+## Survey Results
+{DISTRIBUTION}
+
+## Question
+Based on the survey results above and your own assessment, will you support the following action?
+
+**Action:** {CORRESPONDING_ACTION}
+
+## Response Format
+Please provide your analysis and reasoning only.
