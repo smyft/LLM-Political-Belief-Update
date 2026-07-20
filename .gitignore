@@ -1,0 +1,67 @@
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.pyright/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Packaging and build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Test and coverage artifacts
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# Jupyter notebooks
+.ipynb_checkpoints/
+
+# Experiment outputs and logs
+/results/
+/outputs/
+/logs/
+/wandb/
+/mlruns/
+*.log
+
+# Local model caches, checkpoints, and weights
+.cache/
+/checkpoints/
+/models/
+*.ckpt
+*.gguf
+*.pt
+*.pth
+*.safetensors
+
+# Editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Temporary files
+*.tmp
+*.temp
