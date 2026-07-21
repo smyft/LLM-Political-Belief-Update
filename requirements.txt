@@ -1,14 +1,5 @@
-# Political Polarization Experiment - Python Dependencies
-
-# Core
-numpy>=1.24.0
-torch>=2.0.0
-
-# LLM Inference
-vllm>=0.4.0
-openai>=1.0.0
-requests>=2.31.0
-
-# Utilities
-python-dotenv>=1.0.0
-tqdm>=4.65.0
+# CPU/API runtime dependencies tested with Python 3.11 and 3.12.
+# vLLM is intentionally separated into requirements-vllm.txt.
+httpx==0.28.1
+python-dotenv==1.1.0
+tqdm==4.68.3

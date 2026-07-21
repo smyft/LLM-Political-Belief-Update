@@ -14,6 +14,7 @@ __pycache__/
 .pyright/
 
 # Virtual environments
+.conda/
 .venv/
 venv/
 env/
@@ -65,3 +66,4 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.temp
+*.partial.json

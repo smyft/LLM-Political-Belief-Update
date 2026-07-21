@@ -1,914 +1,542 @@
-"""
-Verbalize Belief Experiment Runner Module.
+"""Verbalized-response political belief experiment runner.
 
-This module implements the experiment workflow using verbalized belief extraction (multi-stage).
-This runner uses verbalize prompts by default, which ask the LLM to verbalize its thinking process.
-
-Key Design:
-- Step 1 and Step 2 run once per (persona, proposal) pair (no redundancy)
-- Step 3 runs for each (persona, proposal, action) combination WITHOUT distribution information
-- Step 4a and Step 4b run for each (persona, proposal, action) combination WITH various distributions
-- Results only contain core data: metadata and answers (no thinking process)
+The runner delegates deterministic selection, treatment assignment, checkpoint
+validation, and compilation to :mod:`src.experiment.base_runner`.  This module
+only instantiates verbalize prompts and strictly validates the model's JSON
+answers.  Invalid responses remain explicit observations and are never
+silently converted to ``Yes``, ``No``, or a default percentage.
 """
+
+from __future__ import annotations
 
 import argparse
-import json
-import random
-import re
+import math
 import sys
-from collections import defaultdict
-from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Any, Mapping, Sequence
 
-# Add parent directory to path for imports
-sys.path.append(str(Path(__file__).parent.parent))
-
-from data.data_loader import load_prompt_template, instantiate_prompt
-from experiment.base_runner import BaseExperimentRunner
-
-
-# Fixed distribution percentages for Step 4
-FIXED_DISTRIBUTION_PERCENTAGES = [10, 30, 50, 70, 90]
+from src.data.data_loader import instantiate_prompt
+from src.experiment.base_runner import BaseExperimentRunner, print_json
+from src.experiment.checkpoints import CheckpointValidationError
+from src.experiment.core import (
+    ExperimentRecord,
+    ResultStatus,
+    ValidationResult,
+    make_record,
+    parse_percentage_response,
+    parse_yes_no_response,
+)
+from src.experiment.planning import StageAssignment, TreatmentAssignment
 
 
 class VerbalizeExperimentRunner(BaseExperimentRunner):
-    """
-    Experiment runner for verbalized belief extraction.
-    
-    This class uses verbalize prompts by default, which instruct the LLM to:
-    - Think step by step
-    - Provide reasoning in a "thinking" field
-    - Provide final answer in an "answer" field
-    - Output in JSON format
-    
-    Key optimization: Step 1 and Step 2 run only once per (persona, proposal) pair,
-    avoiding redundant runs for proposals with multiple actions.
-    """
-    
-    def __init__(self,
-                 model_name: str,
-                 data_dir: str = None,
-                 prompts_dir: str = None,
-                 results_dir: str = None,
-                 temperature: float = 0.0,
-                 max_tokens: int = 2048,
-                 logprobs: int = 20,
-                 seed: int = 42,
-                 debug: bool = False,
-                 use_api: bool = False,
-                 prompt_type: str = "verbalize"):
-        """
-        Initialize the verbalize experiment runner.
-        
-        Args:
-            model_name: Name of the LLM model to use
-            data_dir: Path to the data directory
-            prompts_dir: Path to the prompts directory
-            results_dir: Path to save results
-            temperature: Sampling temperature
-            max_tokens: Maximum tokens to generate
-            logprobs: Number of top log probabilities
-            seed: Random seed
-            debug: Debug mode flag
-            use_api: Whether to use API instead of vLLM
-            prompt_type: Type of prompts to use ('logprob' or 'verbalize')
-        """
-        super().__init__(
-            model_name=model_name,
-            data_dir=data_dir,
-            prompts_dir=prompts_dir,
-            results_dir=results_dir,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            logprobs=logprobs,
-            seed=seed,
-            debug=debug,
-            use_api=use_api,
-            prompt_type=prompt_type
-        )
-        
-        # Create intermediate results directory
-        self.intermediate_dir = self.results_dir / "intermediate"
-        self.intermediate_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Generate experiment ID for this run
-        self.experiment_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        model_name_safe = self.model_name.replace("/", "_")
-        self.experiment_prefix = f"{model_name_safe}_{self.experiment_id}"
-    
-    def load_prompt_templates(self):
-        """Load prompt templates for verbalize belief experiments."""
-        template_files = {
-            "step1": "step1.txt",
-            "step2": "step2.txt",
-            "step3": "step3.txt",
-            "step4a": "step4a.txt",
-            "step4b": "step4b.txt",
-        }
-        
-        for key, filename in template_files.items():
-            template_path = self.prompts_dir / filename
-            if template_path.exists():
-                self.prompt_templates[key] = load_prompt_template(str(template_path))
-                print(f"Loaded template: {filename}")
-            else:
-                print(f"Warning: Template not found: {template_path}")
-    
-    def _save_step_results(self, step_name: str, results: List[Dict], metadata: List[Dict] = None):
-        """
-        Save intermediate results for a specific step.
-        
-        Args:
-            step_name: Name of the step (e.g., 'step1', 'step2', 'step3', 'step4a', 'step4b')
-            results: List of LLM response results
-            metadata: Optional metadata list to include
-        """
-        output_path = self.intermediate_dir / f"{self.experiment_prefix}_{step_name}.json"
-        
-        save_data = {
-            "experiment_id": self.experiment_id,
-            "model": self.model_name,
-            "step": step_name,
-            # "timestamp": datetime.now().isoformat(),
-            "results": results
-        }
-        
-        if metadata:
-            save_data["metadata"] = metadata
-        
-        with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump(save_data, f, indent=2, ensure_ascii=False)
-        
-        print(f"Saved {step_name} results to: {output_path}")
-    
-    def _generate_distribution_text(self, percentage: int) -> str:
-        """
-        Generate distribution text from percentage.
-        
-        Args:
-            percentage: Percentage value (0-100)
-            
-        Returns:
-            Distribution text string
-        """
-        return f"{percentage}% of the U.S. population believe this policy will be beneficial to the United States"
-    
-    def _compute_step1_yes_ratio(self, step1_results: List[Dict], step1_metadata: List[Dict]) -> Dict[str, float]:
-        """
-        Compute the ratio of "Yes" answers for each proposal from Step 1 results.
-        
-        Args:
-            step1_results: List of Step 1 response results
-            step1_metadata: Metadata list for Step 1 (unique persona-proposal pairs)
-            
-        Returns:
-            Dictionary mapping proposal to Yes ratio
-        """
-        proposal_yes_counts = defaultdict(lambda: {"yes": 0, "total": 0})
-        
-        for i, result in enumerate(step1_results):
-            step1_text = result.get("generated_text", "")
-            step1_data = self._parse_json_response(step1_text)
-            belief = step1_data.get("answer") if step1_data else None
-            
-            proposal = step1_metadata[i]["proposal"]
-            proposal_yes_counts[proposal]["total"] += 1
-            if belief and belief.lower() == "yes":
-                proposal_yes_counts[proposal]["yes"] += 1
-        
-        # Compute ratio
-        proposal_ratio = {}
-        for proposal, counts in proposal_yes_counts.items():
-            if counts["total"] > 0:
-                proposal_ratio[proposal] = counts["yes"] / counts["total"]
-            else:
-                proposal_ratio[proposal] = 0.5  # default
-        
-        return proposal_ratio
-    
-    def _get_all_distribution_percentages(self, inferred_percentage: int = None) -> List[int]:
-        """
-        Get all distribution percentages to test including fixed and inferred.
-        
-        Args:
-            inferred_percentage: The inferred percentage from Step 1 (if available)
-            
-        Returns:
-            List of unique percentage values to test
-        """
-        percentages = set(FIXED_DISTRIBUTION_PERCENTAGES)
-        if inferred_percentage is not None:
-            # Round to nearest integer and clamp to 0-100
-            inferred_pct = max(0, min(100, int(round(inferred_percentage))))
-            percentages.add(inferred_pct)
-        return sorted(list(percentages))
-    
-    def run_step1(self, personas: List[str], unique_proposals: List[Tuple[str, str]]) -> Tuple[List[Dict], List[Dict]]:
-        """
-        Run Step 1: First-order Belief (persona's own opinion on policy).
-        
-        This runs once per unique (persona, proposal) pair, not per action.
-        
-        Args:
-            personas: List of personas to test
-            unique_proposals: List of (category, proposal) tuples
-            
-        Returns:
-            Tuple of (step1_results, step1_metadata)
-        """
-        print("\n=== Step 1: First-order Belief ===")
-        
-        dialogues = []
-        step1_metadata = []
-        
-        for persona in personas:
-            for category, proposal in unique_proposals:
-                persona_prompt = self.get_persona_prompt(persona)
-                
-                user_prompt = instantiate_prompt(
-                    self.prompt_templates.get("step1", ""),
-                    POLICY_PROPOSAL=proposal,
-                    PERSONA_INJECTION=persona_prompt
-                )
-                dialogue = [{"role": "user", "content": user_prompt}]
-                dialogues.append(dialogue)
-                
-                step1_metadata.append({
-                    "persona": persona,
-                    "category": category,
-                    "proposal": proposal,
-                })
-        
-        print(f"Processing {len(dialogues)} unique (persona, proposal) pairs...")
-        
-        step1_results = self.llm_interface.chat(
-            dialogue_history=dialogues,
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
-            seed=self.seed,
-            desc="Step 1 (First-order Belief)"
-        )
-        
-        # Save intermediate results
-        self._save_step_results("step1", step1_results, step1_metadata)
-        
-        return step1_results, step1_metadata
-    
-    def run_step2(self, step1_metadata: List[Dict]) -> List[Dict]:
-        """
-        Run Step 2: Second-order Belief (prediction of population opinion).
-        
-        This runs once per unique (persona, proposal) pair, matching Step 1.
-        
-        Args:
-            step1_metadata: Metadata from Step 1 (unique persona-proposal pairs)
-            
-        Returns:
-            List of Step 2 results
-        """
-        print("\n=== Step 2: Second-order Belief (Population Prediction) ===")
-        
-        dialogues = []
-        
-        for meta in step1_metadata:
-            persona_prompt = self.get_persona_prompt(meta['persona'])
-            
-            user_prompt = instantiate_prompt(
-                self.prompt_templates.get("step2", ""),
-                POLICY_PROPOSAL=meta['proposal'],
-                PERSONA_INJECTION=persona_prompt
+    """Run the strict JSON verbalize pipeline."""
+
+    pipeline_name = "verbalize"
+    prompt_specs = {
+        "step1": (
+            "step1.txt",
+            frozenset({"PERSONA_INJECTION", "POLICY_PROPOSAL"}),
+        ),
+        "step2": (
+            "step2.txt",
+            frozenset({"PERSONA_INJECTION", "POLICY_PROPOSAL"}),
+        ),
+        "step3": (
+            "step3.txt",
+            frozenset({"PERSONA_INJECTION", "POLICY_PROPOSAL", "CORRESPONDING_ACTION"}),
+        ),
+        "step4a": (
+            "step4a.txt",
+            frozenset({"PERSONA_INJECTION", "POLICY_PROPOSAL", "DISTRIBUTION"}),
+        ),
+        "step4a_placebo": (
+            "step4a_placebo.txt",
+            frozenset({"PERSONA_INJECTION", "POLICY_PROPOSAL"}),
+        ),
+        "step4b": (
+            "step4b.txt",
+            frozenset(
+                {
+                    "PERSONA_INJECTION",
+                    "POLICY_PROPOSAL",
+                    "CORRESPONDING_ACTION",
+                    "DISTRIBUTION",
+                }
+            ),
+        ),
+        "step4b_placebo": (
+            "step4b_placebo.txt",
+            frozenset({"PERSONA_INJECTION", "POLICY_PROPOSAL", "CORRESPONDING_ACTION"}),
+        ),
+    }
+
+    @staticmethod
+    def _percentage_text(value: float) -> str:
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise TypeError("distribution percentage must be numeric")
+        number = float(value)
+        if not math.isfinite(number) or not 0.0 <= number <= 100.0:
+            raise ValueError("distribution percentage must be finite and in [0, 100]")
+        return f"{number:g}"
+
+    def _distribution_text(self, assignment: TreatmentAssignment) -> str | None:
+        condition = assignment.condition
+        if condition.kind == "fixed_hypothetical_survey":
+            if condition.percentage is None:
+                return None
+            percentage = self._percentage_text(condition.percentage)
+            return (
+                "In this hypothetical survey vignette, "
+                f"{percentage}% of respondents are described as believing this "
+                "policy will be beneficial to the United States."
             )
-            dialogue = [{"role": "user", "content": user_prompt}]
-            dialogues.append(dialogue)
-        
-        print(f"Processing {len(dialogues)} unique (persona, proposal) pairs...")
-        
-        step2_results = self.llm_interface.chat(
-            dialogue_history=dialogues,
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
-            seed=self.seed,
-            desc="Step 2 (Second-order Belief)"
-        )
-        
-        # Save intermediate results
-        self._save_step_results("step2", step2_results, step1_metadata)
-        
-        return step2_results
-    
-    def run_step3(self, step3_base_metadata: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
-        """
-        Run Step 3: Action Support WITHOUT Distribution Information.
-        
-        This step asks whether the LLM would support a specific action without
-        knowing any population distribution information.
-        
-        Args:
-            step3_base_metadata: Metadata for Step 3 experiments (persona, proposal, action combinations)
-            
-        Returns:
-            Tuple of (step3_results, step3_metadata)
-        """
-        print("\n=== Step 3: Action Support (No Distribution) ===")
-        
-        dialogues = []
-        step3_metadata = []
-        
-        for meta in step3_base_metadata:
-            persona_prompt = self.get_persona_prompt(meta['persona'])
-            
-            user_prompt = instantiate_prompt(
-                self.prompt_templates.get("step3", ""),
-                POLICY_PROPOSAL=meta['proposal'],
-                PERSONA_INJECTION=persona_prompt,
-                CORRESPONDING_ACTION=meta['action']
+        if condition.kind == "simulated_persona_consensus":
+            if condition.percentage is None or condition.consensus_n is None:
+                return None
+            percentage = self._percentage_text(condition.percentage)
+            return (
+                f"Across {condition.consensus_n} other simulated persona conditions "
+                "(excluding the current persona), after averaging valid replicates "
+                f"within each persona, {percentage}% answered Yes to the "
+                "policy-benefit question."
             )
-            dialogue = [{"role": "user", "content": user_prompt}]
-            dialogues.append(dialogue)
-            
-            step3_metadata.append({
-                "persona": meta['persona'],
-                "category": meta['category'],
-                "proposal": meta['proposal'],
-                "action_type": meta['action_type'],
-                "action": meta['action'],
-            })
-        
-        print(f"Processing {len(dialogues)} dialogues...")
-        
-        step3_results = self.llm_interface.chat(
-            dialogue_history=dialogues,
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
-            seed=self.seed,
-            desc="Step 3 (Action Support - No Distribution)"
+        raise CheckpointValidationError(
+            f"treatment {condition.kind!r} does not carry distribution information"
         )
-        
-        # Save intermediate results
-        self._save_step_results("step3", step3_results, step3_metadata)
-        
-        return step3_results, step3_metadata
-    
-    def run_step4a(self, step4_base_metadata: List[Dict], step1_yes_ratio: Dict[str, float]) -> Tuple[List[Dict], List[Dict]]:
-        """
-        Run Step 4a: First-order Belief with Distribution Information.
-        
-        For each (persona, proposal, action) combination, iterate through all possible
-        distributions (fixed percentages + inferred from Step 1).
-        
-        Args:
-            step4_base_metadata: Metadata for Step 4 experiments (persona, proposal, action combinations)
-            step1_yes_ratio: Dictionary mapping proposal to Yes ratio from Step 1
-            
-        Returns:
-            Tuple of (step4a_results, step4a_metadata)
-        """
-        print("\n=== Step 4a: First-order Belief with Distribution ===")
-        
-        dialogues = []
-        step4a_metadata = []
-        
-        for meta in step4_base_metadata:
-            proposal = meta['proposal']
-            
-            # Get inferred percentage from Step 1 yes ratio
-            inferred_ratio = step1_yes_ratio.get(proposal, 0.5)
-            inferred_percentage = int(round(inferred_ratio * 100))
-            
-            # Get all distribution percentages to test
-            percentages = self._get_all_distribution_percentages(inferred_percentage)
-            
-            for percentage in percentages:
-                distribution_text = self._generate_distribution_text(percentage)
-                persona_prompt = self.get_persona_prompt(meta['persona'])
-                
-                user_prompt = instantiate_prompt(
-                    self.prompt_templates.get("step4a", ""),
-                    POLICY_PROPOSAL=proposal,
-                    PERSONA_INJECTION=persona_prompt,
-                    DISTRIBUTION=distribution_text
+
+    @staticmethod
+    def _assignment_metadata(
+        assignment: StageAssignment | TreatmentAssignment,
+    ) -> dict[str, Any]:
+        return dict(assignment.to_dict()["metadata"])
+
+    def _build_prompt(
+        self,
+        stage: str,
+        assignment: StageAssignment | TreatmentAssignment,
+    ) -> str | None:
+        metadata = assignment.unit_metadata
+        common = {
+            "PERSONA_INJECTION": self.get_persona_prompt(metadata["persona"]),
+            "POLICY_PROPOSAL": metadata["proposal"],
+        }
+        if isinstance(assignment, StageAssignment):
+            if stage in {"step1", "step2"}:
+                return self._instantiate(stage, **common)
+            if stage == "step3":
+                return self._instantiate(
+                    "step3",
+                    **common,
+                    CORRESPONDING_ACTION=metadata["action"],
                 )
-                dialogue = [{"role": "user", "content": user_prompt}]
-                dialogues.append(dialogue)
-                
-                step4a_metadata.append({
-                    **meta,
-                    "distribution_percentage": percentage,
-                    "distribution_text": distribution_text,
-                    "is_inferred": percentage == inferred_percentage,
-                })
-        
-        print(f"Processing {len(dialogues)} dialogues...")
-        
-        step4a_results = self.llm_interface.chat(
-            dialogue_history=dialogues,
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
-            seed=self.seed,
-            desc="Step 4a (Belief with Distribution)"
+            raise CheckpointValidationError(
+                f"baseline assignment cannot be executed in stage {stage!r}"
+            )
+
+        if not isinstance(assignment, TreatmentAssignment) or stage not in {
+            "step4a",
+            "step4b",
+        }:
+            raise CheckpointValidationError(
+                f"invalid assignment type for stage {stage!r}"
+            )
+        kind = assignment.condition.kind
+        if kind == "no_information_retest":
+            template_name = "step1" if stage == "step4a" else "step3"
+            values = dict(common)
+            if stage == "step4b":
+                values["CORRESPONDING_ACTION"] = metadata["action"]
+            return self._instantiate(template_name, **values)
+        if kind == "placebo_text":
+            template_name = f"{stage}_placebo"
+            values = dict(common)
+            if stage == "step4b":
+                values["CORRESPONDING_ACTION"] = metadata["action"]
+            return self._instantiate(template_name, **values)
+        if kind not in {
+            "fixed_hypothetical_survey",
+            "simulated_persona_consensus",
+        }:
+            raise CheckpointValidationError(f"unknown treatment kind: {kind!r}")
+        distribution = self._distribution_text(assignment)
+        if distribution is None:
+            return None
+        values = {**common, "DISTRIBUTION": distribution}
+        if stage == "step4b":
+            values["CORRESPONDING_ACTION"] = metadata["action"]
+        return self._instantiate(stage, **values)
+
+    def _instantiate(self, template_name: str, **values: Any) -> str:
+        """Render a template whose exact placeholder contract was prevalidated."""
+
+        try:
+            expected = self.prompt_specs[template_name][1]
+            template = self.prompt_templates[template_name]
+        except KeyError as exc:
+            raise ValueError(
+                f"unknown or unloaded prompt template: {template_name}"
+            ) from exc
+        provided = frozenset(values)
+        if provided != expected:
+            missing = sorted(expected - provided)
+            extra = sorted(provided - expected)
+            details = []
+            if missing:
+                details.append("missing " + ", ".join(missing))
+            if extra:
+                details.append("unexpected " + ", ".join(extra))
+            raise ValueError(
+                f"prompt {template_name} values do not match its contract: "
+                + "; ".join(details)
+            )
+        return instantiate_prompt(template, **values)
+
+    @staticmethod
+    def _error_record(
+        assignment: StageAssignment | TreatmentAssignment,
+        metadata: Mapping[str, Any],
+        code: str,
+        message: str,
+    ) -> ExperimentRecord:
+        return make_record(
+            assignment.stage,
+            metadata,
+            ValidationResult(
+                status=ResultStatus.ERROR,
+                error_code=code,
+                message=message,
+            ),
+            sample_id=assignment.sample_id,
         )
-        
-        # Save intermediate results
-        self._save_step_results("step4a", step4a_results, step4a_metadata)
-        
-        return step4a_results, step4a_metadata
-    
-    def run_step4b(self, step4_base_metadata: List[Dict], step1_yes_ratio: Dict[str, float]) -> Tuple[List[Dict], List[Dict]]:
-        """
-        Run Step 4b: Action Support with Distribution Information.
-        
-        For each (persona, proposal, action) combination, iterate through all possible
-        distributions (fixed percentages + inferred from Step 1).
-        
-        Args:
-            step4_base_metadata: Metadata for Step 4 experiments (persona, proposal, action combinations)
-            step1_yes_ratio: Dictionary mapping proposal to Yes ratio from Step 1
-            
-        Returns:
-            Tuple of (step4b_results, step4b_metadata)
-        """
-        print("\n=== Step 4b: Action Support with Distribution ===")
-        
-        dialogues = []
-        step4b_metadata = []
-        
-        for meta in step4_base_metadata:
-            proposal = meta['proposal']
-            action = meta['action']
-            
-            # Get inferred percentage from Step 1 yes ratio
-            inferred_ratio = step1_yes_ratio.get(proposal, 0.5)
-            inferred_percentage = int(round(inferred_ratio * 100))
-            
-            # Get all distribution percentages to test
-            percentages = self._get_all_distribution_percentages(inferred_percentage)
-            
-            for percentage in percentages:
-                distribution_text = self._generate_distribution_text(percentage)
-                persona_prompt = self.get_persona_prompt(meta['persona'])
-                
-                user_prompt = instantiate_prompt(
-                    self.prompt_templates.get("step4b", ""),
-                    POLICY_PROPOSAL=proposal,
-                    PERSONA_INJECTION=persona_prompt,
-                    DISTRIBUTION=distribution_text,
-                    CORRESPONDING_ACTION=action
+
+    def _execute_stage_chunk(
+        self,
+        stage: str,
+        assignments: Sequence[StageAssignment | TreatmentAssignment],
+    ) -> list[ExperimentRecord]:
+        """Generate and parse one same-seed stage chunk in assignment order."""
+
+        if not assignments:
+            return []
+        records: list[ExperimentRecord | None] = [None] * len(assignments)
+        pending_indexes: list[int] = []
+        dialogues: list[list[dict[str, str]]] = []
+
+        for index, assignment in enumerate(assignments):
+            if assignment.stage != stage:
+                raise CheckpointValidationError(
+                    f"assignment {assignment.sample_id} belongs to {assignment.stage}, not {stage}"
                 )
-                dialogue = [{"role": "user", "content": user_prompt}]
-                dialogues.append(dialogue)
-                
-                step4b_metadata.append({
-                    **meta,
-                    "distribution_percentage": percentage,
-                    "distribution_text": distribution_text,
-                    "is_inferred": percentage == inferred_percentage,
-                })
-        
-        print(f"Processing {len(dialogues)} dialogues...")
-        
-        step4b_results = self.llm_interface.chat(
-            dialogue_history=dialogues,
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
-            seed=self.seed,
-            desc="Step 4b (Action Support)"
-        )
-        
-        # Save intermediate results
-        self._save_step_results("step4b", step4b_results, step4b_metadata)
-        
-        return step4b_results, step4b_metadata
-    
-    def _parse_json_response(self, response_text: str) -> Optional[Dict]:
-        """
-        Parse JSON response from LLM.
-        
-        Expected format (verbalize prompts):
-        {
-            "thinking": "...",
-            "answer": "Yes" or "No"
-        }
-        
-        Or for Step 2:
-        {
-            "thinking": "...",
-            "answer": 75  # or "75%" or "75 percent"
-        }
-        
-        Args:
-            response_text: The raw response text from LLM
-            
-        Returns:
-            Parsed JSON as dict, or None if parsing fails
-        """
-        if not response_text:
-            return None
-        
-        # Try to find JSON in the response
-        try:
-            # First try direct JSON parsing
-            return json.loads(response_text)
-        except json.JSONDecodeError:
-            pass
-        
-        # Try to find JSON within markdown code blocks
-        json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', response_text, re.DOTALL)
-        if json_match:
-            try:
-                return json.loads(json_match.group(1))
-            except json.JSONDecodeError:
-                pass
-        
-        # Try to find JSON object in the text
-        json_match = re.search(r'\{[^{}]*"thinking"[^{}]*"answer"[^{}]*\}', response_text, re.DOTALL)
-        if json_match:
-            try:
-                return json.loads(json_match.group(0))
-            except json.JSONDecodeError:
-                pass
-        
-        return None
-    
-    def _extract_percentage_from_response(self, response_text: str) -> Optional[int]:
-        """
-        Extract percentage from JSON response.
-        
-        Expected format:
-        {
-            "thinking": "...",
-            "answer": 75  # or "75%" or "75 percent"
-        }
-        
-        Args:
-            response_text: The raw response text from LLM
-            
-        Returns:
-            Extracted percentage (0-100), or None if extraction fails
-        """
-        if not response_text:
-            return None
-        
-        # First try to parse as JSON
-        json_data = self._parse_json_response(response_text)
-        if json_data:
-            answer = json_data.get("answer")
-            if answer is not None:
-                # If answer is already a number
-                if isinstance(answer, (int, float)):
-                    return max(0, min(100, int(answer)))
-                # If answer is a string
-                if isinstance(answer, str):
-                    # Try to extract number
-                    numbers = re.findall(r'\d+', answer)
-                    if numbers:
-                        return max(0, min(100, int(numbers[0])))
-        
-        # Fallback: try regex on raw text
-        try:
-            numbers = re.findall(r'\d+', response_text)
-            if numbers:
-                predicted_pct = int(numbers[0])
-                return max(0, min(100, predicted_pct))
-        except:
-            pass
-        
-        return None
-    
-    def _compile_results(self, 
-                        step1_results: List[Dict], step1_metadata: List[Dict],
-                        step2_results: List[Dict],
-                        step3_results: List[Dict], step3_metadata: List[Dict],
-                        step4a_results: List[Dict], step4a_metadata: List[Dict],
-                        step4b_results: List[Dict], step4b_metadata: List[Dict],
-                        step_base_metadata: List[Dict]) -> List[Dict]:
-        """
-        Compile all step results into final experiment results.
-        
-        Only keeps core data:
-        - Metadata: PERSONA_INJECTION, POLICY_PROPOSAL, DISTRIBUTION, CORRESPONDING_ACTION
-        - Each step's answer (no thinking process)
-        
-        Args:
-            step1_results: Results from Step 1
-            step1_metadata: Metadata for Step 1 (unique persona-proposal pairs)
-            step2_results: Results from Step 2
-            step3_results: Results from Step 3 (action support without distribution)
-            step3_metadata: Metadata for Step 3
-            step4a_results: Results from Step 4a
-            step4a_metadata: Metadata for Step 4a
-            step4b_results: Results from Step 4b
-            step4b_metadata: Metadata for Step 4b
-            step_base_metadata: Base metadata for Step 3/4 (persona, proposal, action combinations)
-            
-        Returns:
-            List of compiled experiment results
-        """
-        compiled_results = []
-        
-        # Create lookup for Step 1 and Step 2 results by (persona, proposal)
-        step1_lookup = {}
-        step2_lookup = {}
-        for i, meta in enumerate(step1_metadata):
-            key = (meta['persona'], meta['proposal'])
-            
-            # Parse Step 1 result
-            step1_text = step1_results[i].get("generated_text", "")
-            step1_data = self._parse_json_response(step1_text)
-            step1_lookup[key] = {
-                "answer": step1_data.get("answer") if step1_data else None,
-            }
-            
-            # Parse Step 2 result
-            step2_response = step2_results[i].get("generated_text", "").strip()
-            predicted_pct = self._extract_percentage_from_response(step2_response)
-            step2_lookup[key] = {
-                "predicted_percentage": predicted_pct,
-            }
-        
-        # Create lookup for Step 3 results by (persona, proposal, action)
-        step3_lookup = {}
-        for i, meta in enumerate(step3_metadata):
-            key = (meta['persona'], meta['proposal'], meta['action'])
-            result_text = step3_results[i].get("generated_text", "")
-            result_data = self._parse_json_response(result_text)
-            step3_lookup[key] = {
-                "answer": result_data.get("answer") if result_data else None,
-            }
-        
-        # Create lookup for Step 4a and Step 4b results by (persona, proposal, action, distribution_percentage)
-        step4a_lookup = {}
-        for i, meta in enumerate(step4a_metadata):
-            key = (meta['persona'], meta['proposal'], meta['action'], meta['distribution_percentage'])
-            result_text = step4a_results[i].get("generated_text", "")
-            result_data = self._parse_json_response(result_text)
-            step4a_lookup[key] = {
-                "answer": result_data.get("answer") if result_data else None,
-                "distribution_text": meta['distribution_text'],
-                "is_inferred": meta['is_inferred'],
-            }
-        
-        step4b_lookup = {}
-        for i, meta in enumerate(step4b_metadata):
-            key = (meta['persona'], meta['proposal'], meta['action'], meta['distribution_percentage'])
-            result_text = step4b_results[i].get("generated_text", "")
-            result_data = self._parse_json_response(result_text)
-            step4b_lookup[key] = {
-                "answer": result_data.get("answer") if result_data else None,
-                "distribution_text": meta['distribution_text'],
-                "is_inferred": meta['is_inferred'],
-            }
-        
-        # Process each (persona, proposal, action) combination
-        for meta in step_base_metadata:
-            persona = meta['persona']
-            proposal = meta['proposal']
-            action = meta['action']
-            
-            # Get Step 1 and Step 2 results
-            step12_key = (persona, proposal)
-            step1_result = step1_lookup.get(step12_key, {"answer": None})
-            step2_result = step2_lookup.get(step12_key, {"predicted_percentage": None})
-            
-            # Get Step 3 result (action support without distribution)
-            step3_key = (persona, proposal, action)
-            step3_result = step3_lookup.get(step3_key, {"answer": None})
-            
-            # Collect Step 4a results for all distributions
-            step4a_by_distribution = {}
-            for key, data in step4a_lookup.items():
-                if key[0] == persona and key[1] == proposal and key[2] == action:
-                    percentage = key[3]
-                    step4a_by_distribution[percentage] = {
-                        "answer": data['answer'],
-                        "distribution_text": data['distribution_text'],
-                        "is_inferred": data['is_inferred']
-                    }
-            
-            # Collect Step 4b results for all distributions
-            step4b_by_distribution = {}
-            for key, data in step4b_lookup.items():
-                if key[0] == persona and key[1] == proposal and key[2] == action:
-                    percentage = key[3]
-                    step4b_by_distribution[percentage] = {
-                        "answer": data['answer'],
-                        "distribution_text": data['distribution_text'],
-                        "is_inferred": data['is_inferred']
-                    }
-            
-            final_result = {
-                "experiment_id": self.experiment_id,
-                "model": self.model_name,
-                # "timestamp": datetime.now().isoformat(),
-                
-                # Core metadata
-                "persona": persona,
-                "category": meta['category'],
-                "policy_proposal": proposal,
-                "action_type": meta['action_type'],
-                "corresponding_action": action,
-                
-                # Step results (only answers, no thinking)
-                "step1_first_order_belief": step1_result,
-                "step2_second_order_belief": step2_result,
-                "step3_action_support_no_distribution": step3_result,
-                "step4a_first_order_with_distribution": step4a_by_distribution,
-                "step4b_action_support_with_distribution": step4b_by_distribution
-            }
-            compiled_results.append(final_result)
-        
-        return compiled_results
+            metadata = self._assignment_metadata(assignment)
+            prompt = self._build_prompt(stage, assignment)
+            if prompt is None:
+                records[index] = make_record(
+                    stage,
+                    metadata,
+                    ValidationResult(
+                        status=ResultStatus.INVALID,
+                        error_code="simulated_consensus_unavailable",
+                        message=(
+                            "no valid leave-one-persona-out simulated consensus "
+                            "was available; no model call was made"
+                        ),
+                    ),
+                    sample_id=assignment.sample_id,
+                )
+                continue
+            pending_indexes.append(index)
+            dialogues.append([{"role": "user", "content": prompt}])
 
-    def run_experiments(self, personas: List[str] = None,
-                       unique_proposals: List[Tuple[str, str]] = None,
-                       max_experiments: int = None):
-        """
-        Run verbalize belief experiments.
-        
-        This method orchestrates all steps:
-        - Step 1: First-order belief (persona's own opinion on policy) - once per (persona, proposal)
-        - Step 2: Second-order belief (prediction of population opinion) - once per (persona, proposal)
-        - Step 3: Action support WITHOUT distribution information - per (persona, proposal, action)
-        - Step 4a: First-order belief with distribution information - per (persona, proposal, action)
-        - Step 4b: Action support WITH distribution information - per (persona, proposal, action)
-        
-        Args:
-            personas: List of personas to test (None = all)
-            unique_proposals: List of (category, proposal) tuples (None = all)
-            max_experiments: Maximum number of base experiments (None = all)
-        """
-        # Handle debug mode - limit to 2 proposals with ALL actions
-        if self.debug:
-            print("Debug mode enabled: Limiting to 2 proposals with ALL actions.")
-            all_unique_proposals = self.data_loader.get_unique_proposals()
-            unique_proposals = all_unique_proposals[:2]
-            print(f"Debug: Using {len(unique_proposals)} unique proposals")
-            max_experiments = None  # No limit, run all actions for these 2 proposals
+        if pending_indexes:
+            seed = assignments[pending_indexes[0]].seed
+            if any(assignments[index].seed != seed for index in pending_indexes):
+                raise CheckpointValidationError(
+                    "a stage chunk must use one generation seed"
+                )
+            outputs = self._chat_backend(
+                dialogues,
+                seed=seed,
+                max_tokens=self.max_tokens,
+                desc=f"{self.pipeline_name} {stage}",
+            )
+            if len(outputs) != len(pending_indexes):
+                raise CheckpointValidationError(
+                    f"backend returned {len(outputs)} outputs for {len(pending_indexes)} prompts"
+                )
+            for index, output in zip(pending_indexes, outputs):
+                assignment = assignments[index]
+                metadata = self._assignment_metadata(assignment)
+                if isinstance(output, BaseException):
+                    records[index] = self._error_record(
+                        assignment,
+                        metadata,
+                        "backend_exception",
+                        f"{type(output).__name__}: {output}",
+                    )
+                    continue
+                backend_error = output.get("error")
+                if backend_error is not None:
+                    records[index] = self._error_record(
+                        assignment,
+                        metadata,
+                        "backend_error",
+                        str(backend_error),
+                    )
+                    continue
+                generated_text = output.get("generated_text")
+                if not isinstance(generated_text, str):
+                    records[index] = self._error_record(
+                        assignment,
+                        metadata,
+                        "backend_schema_error",
+                        "backend result must contain a string generated_text field",
+                    )
+                    continue
+                validation = (
+                    parse_percentage_response(generated_text)
+                    if stage == "step2"
+                    else parse_yes_no_response(generated_text)
+                )
+                records[index] = make_record(
+                    stage,
+                    metadata,
+                    validation,
+                    sample_id=assignment.sample_id,
+                )
 
-        # Load prompt templates
-        print("Loading prompt templates...")
-        self.load_prompt_templates()
-        
-        # Initialize LLM
-        print(f"Initializing LLM: {self.model_name}...")
-        self.initialize_llm()
-        
-        # Get personas
-        if personas is None:
-            personas = self.data_loader.get_personas(include_none=True)
-
-        if self.debug:
-            personas = [personas[0], personas[1], personas[33]] # hard code None, one politician and one platform
-        
-        print(f"Testing {len(personas)} personas...")
-        
-        # Get unique proposals for Step 1 and Step 2
-        if unique_proposals is None:
-            unique_proposals = self.data_loader.get_unique_proposals()
-        
-        print(f"Testing {len(unique_proposals)} unique proposals...")
-        
-        # Calculate Step 1/2 experiments (no redundancy)
-        step12_count = len(personas) * len(unique_proposals)
-        print(f"Total Step 1/2 experiments (unique persona-proposal pairs): {step12_count}")
-        
-        # Run Step 1: First-order Belief (once per unique persona-proposal pair)
-        step1_results, step1_metadata = self.run_step1(personas, unique_proposals)
-        
-        # Run Step 2: Second-order Belief (once per unique persona-proposal pair)
-        step2_results = self.run_step2(step1_metadata)
-        
-        # Compute Step 1 Yes ratio per proposal for distribution inference
-        step1_yes_ratio = self._compute_step1_yes_ratio(step1_results, step1_metadata)
-        print(f"Computed Step 1 Yes ratios for {len(step1_yes_ratio)} proposals")
-        
-        # Build Step 3/4 metadata: (persona, proposal, action) combinations
-        step_base_metadata = []
-        for persona in personas:
-            for category, proposal in unique_proposals:
-                actions = self.data_loader.get_actions_for_proposal(category, proposal)
-                for action_type, action_description in actions:
-                    step_base_metadata.append({
-                        "persona": persona,
-                        "category": category,
-                        "proposal": proposal,
-                        "action_type": action_type,
-                        "action": action_description,
-                    })
-        
-        # Limit to max_experiments if specified (non-debug mode)
-        if max_experiments and not self.debug:
-            step_base_metadata = step_base_metadata[:max_experiments]
-        
-        print(f"Total Step 3/4 base experiments (persona-proposal-action combinations): {len(step_base_metadata)}")
-        
-        # Run Step 3: Action Support WITHOUT Distribution
-        step3_results, step3_metadata = self.run_step3(step_base_metadata)
-        
-        # Run Step 4a: First-order Belief with Distribution
-        step4a_results, step4a_metadata = self.run_step4a(step_base_metadata, step1_yes_ratio)
-        
-        # Run Step 4b: Action Support with Distribution
-        step4b_results, step4b_metadata = self.run_step4b(step_base_metadata, step1_yes_ratio)
-        
-        # Compile all results
-        print("\n=== Compiling Results ===")
-        self.results = self._compile_results(
-            step1_results, step1_metadata,
-            step2_results,
-            step3_results, step3_metadata,
-            step4a_results, step4a_metadata,
-            step4b_results, step4b_metadata,
-            step_base_metadata
-        )
-        
-        # Save final results
-        self.save_results()
-        print(f"\nCompleted {len(self.results)} experiments.")
+        if any(record is None for record in records):
+            raise RuntimeError(
+                "internal error: a verbalize assignment produced no record"
+            )
+        return [record for record in records if record is not None]
 
 
-def main():
-    """Main entry point for the verbalize experiment runner."""
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def _nonnegative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative integer")
+    return parsed
+
+
+def _percentage(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed) or not 0.0 <= parsed <= 100.0:
+        raise argparse.ArgumentTypeError("must be a finite percentage from 0 to 100")
+    return parsed
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run political belief experiments with LLM (Verbalize)"
+        description="Run political belief experiments using strict verbalized JSON answers."
     )
-    
-    # Model configuration
-    parser.add_argument("--model", type=str, default="openai/gpt-4o-mini",
-                        help="Model name")
-    
-    # Experiment configuration
-    parser.add_argument("--personas", type=str, nargs="*", default=None,
-                        help="Specific personas to test (default: all)")
-    parser.add_argument("--categories", type=str, nargs="*", default=None,
-                        help="Specific categories to test (default: all)")
-    parser.add_argument("--max-experiments", type=int, default=None,
-                        help="Maximum number of experiments to run")
-    
-    # LLM configuration
-    parser.add_argument("--temperature", type=float, default=0.0,
-                        help="Sampling temperature")
-    parser.add_argument("--max-tokens", type=int, default=2048,
-                        help="Maximum tokens to generate")
-    parser.add_argument("--seed", type=int, default=42,
-                        help="Random seed")
-    
-    # Output configuration
-    parser.add_argument("--results-dir", type=str, default=None,
-                        help="Directory to save results")
-    parser.add_argument("--debug", action="store_true",
-                        help="Debug mode")
-    parser.add_argument("--use-api", action="store_true",
-                        help="Use API instead of vLLM")
-    
-    # Prompt configuration
-    parser.add_argument("--prompt-type", type=str, default="verbalize",
-                        choices=["logprob", "verbalize"],
-                        help="Type of prompts to use")
-    parser.add_argument("--prompts-dir", type=str, default=None,
-                        help="Custom prompts directory (overrides prompt-type)")
-    
-    cmd = ["--use-api", "--debug"]
-    args = parser.parse_args(cmd)
-    
-    # Create experiment runner
-    runner = VerbalizeExperimentRunner(
-        model_name=args.model,
-        results_dir=args.results_dir,
-        temperature=args.temperature,
-        max_tokens=args.max_tokens,
-        seed=args.seed,
-        debug=args.debug,
-        use_api=args.use_api,
-        prompts_dir=args.prompts_dir,
-        prompt_type=args.prompt_type
+    parser.add_argument("--model", help="model identifier or local path")
+    parser.add_argument("--model-revision", help="optional immutable model revision")
+    parser.add_argument(
+        "--tokenizer-revision",
+        help="optional tokenizer revision (defaults to --model-revision)",
     )
-    
-    # Get personas
-    personas = args.personas if args.personas else None
-    
-    # Get unique proposals
-    if args.categories:
-        unique_proposals = []
-        all_proposals = runner.data_loader.get_unique_proposals()
-        for cat, prop in all_proposals:
-            if cat in args.categories:
-                unique_proposals.append((cat, prop))
-    else:
-        unique_proposals = None
-    
-    # Run experiments
-    try:
-        runner.run_experiments(
-            personas=personas,
-            unique_proposals=unique_proposals,
-            max_experiments=args.max_experiments
+    parser.add_argument(
+        "--code-revision",
+        help="optional remote-code revision (defaults to --model-revision)",
+    )
+    parser.add_argument(
+        "--persona",
+        "--personas",
+        nargs="+",
+        action="extend",
+        dest="personas",
+        help="persona labels; repeat either option as needed (default: all)",
+    )
+    parser.add_argument(
+        "--category",
+        "--categories",
+        nargs="+",
+        action="extend",
+        dest="categories",
+        help="policy categories; repeat either option as needed (default: all)",
+    )
+    parser.add_argument(
+        "--max-base-units",
+        "--max-experiments",
+        dest="max_base_units",
+        type=_positive_int,
+        help="cap persona-proposal-action units before any model call",
+    )
+    parser.add_argument("--replicates", type=_positive_int, default=1)
+    parser.add_argument(
+        "--fixed-percentages", nargs="+", type=_percentage, default=[10, 30, 50, 70, 90]
+    )
+    parser.set_defaults(
+        include_simulated_consensus=True,
+        include_retest=True,
+        include_placebo=True,
+    )
+    parser.add_argument(
+        "--simulated-consensus",
+        dest="include_simulated_consensus",
+        action="store_true",
+        help="include leave-one-persona-out simulated consensus (default)",
+    )
+    parser.add_argument(
+        "--no-simulated-consensus",
+        dest="include_simulated_consensus",
+        action="store_false",
+    )
+    parser.add_argument("--retest", dest="include_retest", action="store_true")
+    parser.add_argument("--no-retest", dest="include_retest", action="store_false")
+    parser.add_argument("--placebo", dest="include_placebo", action="store_true")
+    parser.add_argument("--no-placebo", dest="include_placebo", action="store_false")
+
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--max-tokens", type=_positive_int, default=2048)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--chunk-size", type=_positive_int, default=128)
+    parser.add_argument("--data-dir")
+    parser.add_argument("--prompts-dir")
+    parser.add_argument("--results-dir")
+    parser.add_argument("--no-progress", action="store_true")
+
+    parser.add_argument(
+        "--use-api", action="store_true", help="use an OpenAI-compatible API"
+    )
+    parser.add_argument("--api-base-url", help="API endpoint; defaults to OpenRouter")
+    parser.add_argument("--api-timeout", type=float, default=60.0)
+    parser.add_argument("--api-max-retries", type=_nonnegative_int, default=2)
+    parser.add_argument("--api-max-workers", type=_positive_int, default=4)
+    parser.add_argument("--api-retry-base-delay", type=float, default=0.5)
+    parser.add_argument("--api-retry-max-delay", type=float, default=8.0)
+    parser.add_argument("--api-retry-total-timeout", type=float, default=180.0)
+
+    parser.add_argument("--trust-remote-code", action="store_true")
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument("--tensor-parallel-size", type=_positive_int, default=1)
+    parser.add_argument("--dtype", default="auto")
+    parser.add_argument("--enforce-eager", action="store_true")
+
+    parser.add_argument(
+        "--dry-run", action="store_true", help="plan and print counts only"
+    )
+    parser.add_argument("--resume-from", metavar="RUN_ID")
+    parser.add_argument(
+        "--resume-step",
+        choices=("step1", "step2", "step3", "step4a", "step4b"),
+        default="step1",
+    )
+    parser.add_argument("--list-checkpoints", action="store_true")
+    return parser
+
+
+def _runner_kwargs(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "model_name": args.model or "__restored_from_checkpoint_manifest__",
+        "model_revision": args.model_revision,
+        "tokenizer_revision": args.tokenizer_revision,
+        "code_revision": args.code_revision,
+        "data_dir": args.data_dir,
+        "prompts_dir": args.prompts_dir,
+        "results_dir": args.results_dir,
+        "temperature": args.temperature,
+        "max_tokens": args.max_tokens,
+        "seed": args.seed,
+        "replicates": args.replicates,
+        "fixed_percentages": args.fixed_percentages,
+        "include_simulated_consensus": args.include_simulated_consensus,
+        "include_retest": args.include_retest,
+        "include_placebo": args.include_placebo,
+        "chunk_size": args.chunk_size,
+        "use_api": args.use_api,
+        "api_base_url": args.api_base_url,
+        "api_timeout": args.api_timeout,
+        "api_max_retries": args.api_max_retries,
+        "api_max_workers": args.api_max_workers,
+        "api_retry_base_delay": args.api_retry_base_delay,
+        "api_retry_max_delay": args.api_retry_max_delay,
+        "api_retry_total_timeout": args.api_retry_total_timeout,
+        "trust_remote_code": args.trust_remote_code,
+        "gpu_memory_utilization": args.gpu_memory_utilization,
+        "tensor_parallel_size": args.tensor_parallel_size,
+        "dtype": args.dtype,
+        "enforce_eager": args.enforce_eager,
+        "show_progress": not args.no_progress,
+    }
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """CLI entry point; returns a process-compatible status code."""
+
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    default_results = Path(__file__).resolve().parents[2] / "results"
+    if args.list_checkpoints:
+        print_json(
+            VerbalizeExperimentRunner.list_checkpoint_runs(
+                args.results_dir or default_results
+            )
         )
+        return 0
+    if not args.model and not args.resume_from:
+        parser.error("--model is required for a new run or dry-run")
+
+    runner: VerbalizeExperimentRunner | None = None
+    try:
+        runner = VerbalizeExperimentRunner(**_runner_kwargs(args))
+        if args.dry_run:
+            print_json(
+                runner.dry_run(
+                    personas=args.personas,
+                    categories=args.categories,
+                    max_base_units=args.max_base_units,
+                )
+            )
+            return 0
+        if args.resume_from:
+            output_path = runner.run_experiments_from_step(
+                args.resume_from,
+                args.resume_step,
+            )
+        else:
+            output_path = runner.run_experiments(
+                personas=args.personas,
+                categories=args.categories,
+                max_base_units=args.max_base_units,
+            )
+        print(f"Results written to {output_path}")
+        invalid_count = sum(
+            int(values.get("invalid", 0))
+            for values in runner.last_status_summary.values()
+        )
+        if invalid_count:
+            print(
+                f"Warning: run contains {invalid_count} invalid observations; "
+                "see status_summary in the result JSON.",
+                file=sys.stderr,
+            )
+        if runner.has_execution_errors():
+            print(
+                "Run contains backend ERROR observations and is not fully successful. "
+                "Checkpoint shards are immutable; start a new run to retry them.",
+                file=sys.stderr,
+            )
+            return 1
+        return 0
+    except KeyboardInterrupt:
+        print("Interrupted.", file=sys.stderr)
+        return 130
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
     finally:
-        runner.cleanup()
-    
-    print("Experiment completed!")
+        if runner is not None:
+            runner.cleanup()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

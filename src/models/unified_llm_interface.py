@@ -1,281 +1,469 @@
-import os
-import json
-import time
-import requests
-import re
-from typing import List, Dict, Optional, Any, Union
-from dotenv import load_dotenv
+"""Unified API and vLLM model interfaces.
 
-# Import tqdm for progress display
+The API backend speaks the OpenAI-compatible HTTP protocol directly and
+defaults to OpenRouter.  Credentials are validated before constructing the
+HTTP client, and ``OPENAI_API_KEY`` is never consulted.
+"""
+
+from __future__ import annotations
+
+import math
+import os
+import random
+import time
+from concurrent.futures import ThreadPoolExecutor
+from email.utils import parsedate_to_datetime
+from typing import Any, TypeAlias
+
+import httpx
+from dotenv import load_dotenv
 from tqdm import tqdm
 
-# Try to import VLLMInterface, but don't fail if vllm is not installed (for API-only usage)
 try:
     from src.models.vllm_interface import VLLMInterface, VLLM_AVAILABLE
-except ImportError:
+except ImportError:  # pragma: no cover - protects API-only installations
     VLLMInterface = None
     VLLM_AVAILABLE = False
-    print("Warning: VLLMInterface could not be imported. Only API usage will be available.")
 
-from openai import OpenAI
-import openai
 
-# def extract_belief_from_response(response_text: str) -> Optional[str]:
-#     """
-#     Extract belief (Yes/No) from the model's response.
-    
-#     Expected formats based on verbalize prompts:
-#     - JSON: {"thinking": "...", "answer": "Yes"} or {"answer": "Yes"}
-#     - Markdown JSON: ```json {"answer": "Yes"} ```
-#     - Plain text: "Yes" or "No" (short responses)
-#     """
-#     if not response_text:
-#         return None
-    
-#     # Try to parse as JSON first
-#     try:
-#         # Try direct JSON parsing
-#         data = json.loads(response_text)
-#         if isinstance(data, dict):
-#             answer = data.get("answer")
-#             if answer and isinstance(answer, str):
-#                 answer_lower = answer.lower()
-#                 if "yes" in answer_lower:
-#                     return "Yes"
-#                 if "no" in answer_lower:
-#                     return "No"
-#     except (json.JSONDecodeError, TypeError):
-#         pass
-    
-#     # Try to find JSON in markdown code blocks
-#     json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', response_text, re.DOTALL)
-#     if json_match:
-#         try:
-#             data = json.loads(json_match.group(1))
-#             if isinstance(data, dict):
-#                 answer = data.get("answer")
-#                 if answer and isinstance(answer, str):
-#                     answer_lower = answer.lower()
-#                     if "yes" in answer_lower:
-#                         return "Yes"
-#                     if "no" in answer_lower:
-#                         return "No"
-#         except (json.JSONDecodeError, TypeError):
-#             pass
-    
-#     # Look for "Answer: Yes" or "Answer: No" (case insensitive)
-#     match = re.search(r"answer:\s*(yes|no)", response_text, re.IGNORECASE)
-#     if match:
-#         return match.group(1).capitalize()
-    
-#     # Fallback: Look for just "Yes" or "No" if it's a short response (e.g. < 50 chars)
-#     clean_text = response_text.strip().lower()
-#     if len(clean_text) < 50:
-#         if "yes" in clean_text and "no" not in clean_text:
-#             return "Yes"
-#         if "no" in clean_text and "yes" not in clean_text:
-#             return "No"
-            
-#     return None
+Dialogue: TypeAlias = list[dict[str, str]]
+DialogueInput: TypeAlias = Dialogue | list[Dialogue]
+
+
+def _normalize_dialogues(
+    dialogue_history: DialogueInput,
+) -> tuple[list[Dialogue], bool]:
+    """Validate dialogue input and return ``(batch, was_batch)``."""
+
+    if not isinstance(dialogue_history, list) or not dialogue_history:
+        raise TypeError("dialogue_history must be a non-empty list")
+
+    if isinstance(dialogue_history[0], dict):
+        dialogues = [dialogue_history]
+        was_batch = False
+    elif isinstance(dialogue_history[0], list):
+        dialogues = dialogue_history
+        was_batch = True
+    else:
+        raise TypeError("dialogue_history must be List[Dict] or List[List[Dict]]")
+
+    for dialogue_index, dialogue in enumerate(dialogues):
+        if not isinstance(dialogue, list) or not dialogue:
+            raise TypeError(f"dialogue at index {dialogue_index} must be non-empty")
+        for message_index, message in enumerate(dialogue):
+            if not isinstance(message, dict):
+                raise TypeError(
+                    f"message at dialogue[{dialogue_index}][{message_index}] must be a dict"
+                )
+            if {"role", "content"}.difference(message):
+                raise ValueError(
+                    f"message at dialogue[{dialogue_index}][{message_index}] "
+                    "must contain role and content"
+                )
+            if not isinstance(message["role"], str) or not isinstance(
+                message["content"], str
+            ):
+                raise TypeError("message role and content must be strings")
+
+    return dialogues, was_batch
 
 
 class APIInterface:
-    """
-    Interface for interacting with closed-source LLMs via API (OpenAI compatible).
-    """
-    def __init__(self, model_name: str, api_key: str = None, base_url: str = None, **kwargs):
+    """OpenAI-compatible HTTP interface with explicit, bounded retries."""
+
+    def __init__(
+        self,
+        model_name: str,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        timeout: float = 60.0,
+        max_retries: int = 2,
+        max_workers: int = 4,
+        retry_base_delay: float = 0.5,
+        retry_max_delay: float = 8.0,
+        retry_total_timeout: float = 180.0,
+        transport: httpx.BaseTransport | None = None,
+        **_: Any,
+    ) -> None:
         load_dotenv()
         self.model_name = model_name
-        self.api_key = api_key or os.getenv("OPENROUTER_API_KEY")
-        self.base_url = base_url or os.getenv("OPENROUTER_BASE_URL") or "https://openrouter.ai/api/v1"
-        
-        if OpenAI is None:
-            raise ImportError("openai package is required for APIInterface")
-            
-        self.client = OpenAI(
-            base_url=self.base_url,
-            api_key=self.api_key,
+        self.base_url = (
+            base_url
+            or os.getenv("OPENROUTER_BASE_URL")
+            or "https://openrouter.ai/api/v1"
+        ).strip()
+
+        try:
+            parsed_base_url = httpx.URL(self.base_url)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("base_url must be a valid absolute HTTP(S) URL") from exc
+        if (
+            not parsed_base_url.is_absolute_url
+            or parsed_base_url.scheme not in {"http", "https"}
+            or not parsed_base_url.host
+            or bool(parsed_base_url.username)
+            or bool(parsed_base_url.password)
+            or parsed_base_url.query
+            or parsed_base_url.fragment
+        ):
+            raise ValueError(
+                "base_url must be an absolute HTTP(S) URL without credentials, "
+                "query parameters, or fragments"
+            )
+        local_hosts = {"localhost", "127.0.0.1", "::1"}
+        if (
+            parsed_base_url.scheme != "https"
+            and parsed_base_url.host not in local_hosts
+        ):
+            raise ValueError(
+                "base_url must use HTTPS except for a local loopback endpoint"
+            )
+
+        is_openrouter = parsed_base_url.host == "openrouter.ai" or str(
+            parsed_base_url.host
+        ).endswith(".openrouter.ai")
+
+        # OPENAI_API_KEY is intentionally never consulted: sending it to an
+        # OpenRouter or other compatible endpoint would leak the wrong secret.
+        if api_key is None and not is_openrouter:
+            raise ValueError(
+                "A custom base_url requires an explicitly paired api_key; "
+                "OPENROUTER_API_KEY is never forwarded to a non-OpenRouter host."
+            )
+        resolved_key = (
+            api_key
+            or (os.getenv("OPENROUTER_API_KEY") if is_openrouter else None)
+            or ""
+        ).strip()
+        if not resolved_key:
+            raise ValueError(
+                "An OpenRouter API key is required. Pass api_key or set "
+                "OPENROUTER_API_KEY; OPENAI_API_KEY is intentionally not used."
+            )
+        if (
+            not isinstance(max_retries, int)
+            or isinstance(max_retries, bool)
+            or max_retries < 0
+        ):
+            raise ValueError("max_retries must be a non-negative integer")
+        if (
+            not isinstance(max_workers, int)
+            or isinstance(max_workers, bool)
+            or max_workers < 1
+        ):
+            raise ValueError("max_workers must be a positive integer")
+        for name, numeric_value in (
+            ("timeout", timeout),
+            ("retry_base_delay", retry_base_delay),
+            ("retry_max_delay", retry_max_delay),
+            ("retry_total_timeout", retry_total_timeout),
+        ):
+            if isinstance(numeric_value, bool) or not isinstance(
+                numeric_value, (int, float)
+            ):
+                raise TypeError(f"{name} must be numeric")
+            if not math.isfinite(float(numeric_value)):
+                raise ValueError(f"{name} must be finite")
+        if timeout <= 0 or retry_total_timeout <= 0:
+            raise ValueError("timeout and retry_total_timeout must be positive")
+        if retry_base_delay < 0 or retry_max_delay < 0:
+            raise ValueError("retry delays must be non-negative")
+        if retry_max_delay < retry_base_delay:
+            raise ValueError("retry_max_delay must be at least retry_base_delay")
+
+        self.max_workers = max_workers
+        self.max_retries = max_retries
+        self.retry_base_delay = retry_base_delay
+        self.retry_max_delay = retry_max_delay
+        self.request_timeout = float(timeout)
+        self.retry_total_timeout = float(retry_total_timeout)
+        self._closed = False
+        self._completion_url = f"{self.base_url.rstrip('/')}/chat/completions"
+        self.client = httpx.Client(
+            headers={
+                "Authorization": f"Bearer {resolved_key}",
+                "Content-Type": "application/json",
+            },
+            timeout=httpx.Timeout(timeout),
+            transport=transport,
         )
 
-    def chat(self, dialogue_history: List[Dict], temperature: float = 0, max_tokens: int = 1000, 
-             seed: int = 42, show_progress: bool = True, desc: str = "Processing", **kwargs) -> List[Dict]:
-        """
-        Generate responses using the API.
-        Supports both single dialogue and batch (list of dialogues).
-        
-        Args:
-            dialogue_history: Single dialogue or list of dialogues
-            temperature: Sampling temperature
-            max_tokens: Maximum tokens to generate
-            seed: Random seed
-            show_progress: Whether to show progress bar for batch processing
-            desc: Description for the progress bar
-            **kwargs: Additional arguments for the API
-            
-        Returns:
-            List of response dictionaries
-        """
-        # Handle batching if dialogue_history is a list of lists (batch processing)
-        # Note: OpenAI API doesn't support batching in a single request like vLLM, 
-        # so we iterate. For true parallelism, we would need async or threads.
-        if isinstance(dialogue_history[0], list):
-            results = []
-            iterator = dialogue_history
-            if show_progress:
-                iterator = tqdm(dialogue_history, desc=desc, unit="dialogue")
-            for dialogue in iterator:
-                result = self._chat_single(dialogue, temperature, max_tokens, seed, **kwargs)
-                results.append(result)
-            return results
-        else:
-            # Single dialogue
-            return [self._chat_single(dialogue_history, temperature, max_tokens, seed, **kwargs)]
+    @staticmethod
+    def _retry_after_seconds(response: httpx.Response) -> float | None:
+        """Parse Retry-After in either delta-seconds or HTTP-date form."""
 
-    def _chat_single(self, dialogue: List[Dict], temperature: float, max_tokens: int, seed: int, **kwargs) -> Dict:
-        max_retries = 8
-        base_delay = 1
-        retryable_errors = (
-            openai.APIConnectionError, 
-            openai.RateLimitError,
-            openai.APIError,
-            requests.exceptions.ConnectionError,
-            requests.exceptions.Timeout
-        )
-
-        retries = 0
-        while True:
+        value = response.headers.get("Retry-After")
+        if not value:
+            return None
+        try:
+            return max(0.0, float(value))
+        except ValueError:
             try:
-                completion = self.client.chat.completions.create(
-                    model=self.model_name,
-                    messages=dialogue,
-                    temperature=temperature,
-                    seed=seed,
-                    max_tokens=max_tokens,
-                    **kwargs
-                )
-                return {
-                    "generated_text": completion.choices[0].message.content,
-                    "finish_reason": completion.choices[0].finish_reason
-                }
-            except Exception as e:
-                if retries >= max_retries:
-                    print(f"Request failed. Reach max retry: {max_retries}")
-                    return {"generated_text": "", "error": str(e)}
-                
-                # Check if error is retryable
-                is_retryable = isinstance(e, retryable_errors)
-                if not is_retryable:
-                    # If it's not a connection/rate limit error, it might be a bad request
-                    # But for robustness, we'll retry anyway unless we're sure
-                    pass
+                retry_at = parsedate_to_datetime(value)
+                if retry_at.tzinfo is None:
+                    return None
+                return max(0.0, retry_at.timestamp() - time.time())
+            except (TypeError, ValueError, OverflowError):
+                return None
 
-                delay = base_delay * (2 ** retries)
-                print(f"Retry {retries+1}/{max_retries} in {delay}s: {type(e).__name__} - {str(e)}")
+    @staticmethod
+    def _is_retryable_status(status_code: int) -> bool:
+        return status_code in {408, 409, 429} or status_code >= 500
+
+    def _retry_delay(self, retry_index: int, response: httpx.Response | None) -> float:
+        server_delay = (
+            self._retry_after_seconds(response) if response is not None else None
+        )
+        base_delay = (
+            server_delay
+            if server_delay is not None
+            else min(self.retry_max_delay, self.retry_base_delay * (2**retry_index))
+        )
+        # Small positive jitter avoids synchronized retry waves while keeping a
+        # server-provided Retry-After as the minimum wait.
+        jitter_ceiling = min(1.0, base_delay * 0.1)
+        return base_delay + random.uniform(0.0, jitter_ceiling)
+
+    def _chat_single(
+        self,
+        dialogue: Dialogue,
+        temperature: float,
+        max_tokens: int,
+        seed: int,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        if self._closed or self.client is None:
+            raise RuntimeError("APIInterface is closed")
+
+        protected = {"model", "messages", "temperature", "seed", "max_tokens"}
+        duplicate = protected.intersection(kwargs)
+        if duplicate:
+            raise ValueError(
+                "request kwargs cannot override: " + ", ".join(sorted(duplicate))
+            )
+        payload = {
+            "model": self.model_name,
+            "messages": dialogue,
+            "temperature": temperature,
+            "seed": seed,
+            "max_tokens": max_tokens,
+            **kwargs,
+        }
+
+        response = None
+        started_at = time.monotonic()
+        for attempt in range(self.max_retries + 1):
+            remaining = self.retry_total_timeout - (time.monotonic() - started_at)
+            if remaining <= 0:
+                raise httpx.TimeoutException("total API retry deadline exceeded")
+            try:
+                response = self.client.post(
+                    self._completion_url,
+                    json=payload,
+                    timeout=min(self.request_timeout, remaining),
+                )
+            except httpx.TransportError:
+                if attempt >= self.max_retries:
+                    raise
+                delay = self._retry_delay(attempt, None)
+                remaining = self.retry_total_timeout - (time.monotonic() - started_at)
+                if delay >= remaining:
+                    raise
                 time.sleep(delay)
-                retries += 1
-    
-    def free_memory(self):
-        # API doesn't need memory cleanup
-        pass
+                continue
+
+            if (
+                self._is_retryable_status(response.status_code)
+                and attempt < self.max_retries
+            ):
+                delay = self._retry_delay(attempt, response)
+                remaining = self.retry_total_timeout - (time.monotonic() - started_at)
+                if delay >= remaining:
+                    response.raise_for_status()
+                time.sleep(delay)
+                continue
+            response.raise_for_status()
+            break
+
+        if response is None:  # defensive; every loop path either sets or raises
+            raise RuntimeError("request completed without an HTTP response")
+        try:
+            completion = response.json()
+            choice = completion["choices"][0]
+            generated_text = choice["message"]["content"] or ""
+            finish_reason = choice.get("finish_reason")
+            if not isinstance(generated_text, str):
+                raise TypeError("message content must be a string")
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "API response does not match the chat completions schema"
+            ) from exc
+        return {
+            "generated_text": generated_text,
+            "finish_reason": finish_reason,
+        }
+
+    def chat(
+        self,
+        dialogue_history: DialogueInput,
+        temperature: float = 0,
+        max_tokens: int = 1000,
+        seed: int = 42,
+        show_progress: bool = True,
+        desc: str = "Processing",
+        **kwargs: Any,
+    ) -> list[dict[str, Any]]:
+        """Generate responses concurrently while retaining input order."""
+
+        dialogues, was_batch = _normalize_dialogues(dialogue_history)
+        if not was_batch:
+            return [
+                self._chat_single(dialogues[0], temperature, max_tokens, seed, **kwargs)
+            ]
+
+        workers = min(self.max_workers, len(dialogues))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            # executor.map yields results in input order even when requests
+            # complete out of order.
+            ordered_results = executor.map(
+                lambda dialogue: self._chat_single(
+                    dialogue, temperature, max_tokens, seed, **kwargs
+                ),
+                dialogues,
+            )
+            if show_progress:
+                ordered_results = tqdm(
+                    ordered_results,
+                    total=len(dialogues),
+                    desc=desc,
+                    unit="dialogue",
+                )
+            return list(ordered_results)
+
+    def close(self) -> None:
+        """Close the underlying HTTP client; safe to call repeatedly."""
+
+        if self._closed:
+            return
+        self._closed = True
+        client, self.client = self.client, None
+        if client is not None:
+            client.close()
+
+    def free_memory(self) -> None:
+        """Backward-compatible cleanup alias used by existing runners."""
+
+        self.close()
+
+    def __enter__(self) -> APIInterface:
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
 
 
 class UnifiedLLMInterface:
-    """
-    Unified interface for both vLLM and API backends.
-    """
-    def __init__(self, model_name: str, use_api: bool = False, **kwargs):
+    """Uniform facade for API and local vLLM backends."""
+
+    _API_KWARGS = {
+        "api_key",
+        "base_url",
+        "timeout",
+        "max_retries",
+        "max_workers",
+        "retry_base_delay",
+        "retry_max_delay",
+        "retry_total_timeout",
+        "transport",
+    }
+    _VLLM_KWARGS = {
+        "gpu_memory_utilization",
+        "tensor_parallel_size",
+        "trust_remote_code",
+        "revision",
+        "tokenizer_revision",
+        "code_revision",
+        "dtype",
+        "enforce_eager",
+    }
+
+    def __init__(self, model_name: str, use_api: bool = False, **kwargs: Any) -> None:
         self.use_api = use_api
         self.model_name = model_name
-        
+
         if use_api:
-            print(f"Initializing API Interface for model: {model_name}")
-            self.interface = APIInterface(model_name, **kwargs)
+            api_kwargs = {
+                key: value for key, value in kwargs.items() if key in self._API_KWARGS
+            }
+            self.interface = APIInterface(model_name, **api_kwargs)
         else:
-            print(f"Initializing vLLM Interface for model: {model_name}")
             if VLLMInterface is None or not VLLM_AVAILABLE:
-                raise ImportError("vLLM not installed or VLLMInterface not found. Please install vLLM with: pip install vllm")
-            # Filter kwargs for VLLMInterface
-            vllm_kwargs = {k: v for k, v in kwargs.items() if k in ['gpu_memory_utilization', 'tensor_parallel_size', 'trust_remote_code', 'dtype', 'enforce_eager']}
+                raise ImportError(
+                    "vLLM is unavailable. Install the repository's vLLM "
+                    "dependencies on a supported GPU host."
+                )
+            vllm_kwargs = {
+                key: value for key, value in kwargs.items() if key in self._VLLM_KWARGS
+            }
             self.interface = VLLMInterface(model_name, **vllm_kwargs)
             self.interface.load_model()
 
-    def chat(self, dialogue_history: Union[List[Dict], List[List[Dict]]], 
-             show_progress: bool = True, desc: str = "Processing", **kwargs) -> List[Dict]:
-        """
-        Unified chat method.
-        
-        Args:
-            dialogue_history: Single dialogue or list of dialogues
-            show_progress: Whether to show progress bar for batch processing
-            desc: Description for the progress bar
-            **kwargs: Additional arguments for the chat method
-            
-        Returns:
-            List of response dictionaries
-        """
-        return self.interface.chat(dialogue_history, show_progress=show_progress, desc=desc, **kwargs)
-    
-    def chat_with_continuation(self, dialogue_history: Union[List[Dict], List[List[Dict]]], 
-                               show_progress: bool = True, desc: str = "Processing", **kwargs) -> List[Dict]:
-        """
-        Chat with continuation for logprob extraction (vLLM only).
-        
-        This method continues the last assistant message to extract logprobs for the next token.
-        Only available when using vLLM backend.
-        
-        Args:
-            dialogue_history: Single dialogue or list of dialogues where the last message
-                             is from assistant and should be continued
-            show_progress: Whether to show progress bar for batch processing
-            desc: Description for the progress bar
-            **kwargs: Additional arguments for the chat method
-            
-        Returns:
-            List of response dictionaries containing generated_text, logprobs, and probabilities
-        """
+    def chat(
+        self,
+        dialogue_history: DialogueInput,
+        show_progress: bool = True,
+        desc: str = "Processing",
+        **kwargs: Any,
+    ) -> list[dict[str, Any]]:
+        return self.interface.chat(
+            dialogue_history,
+            show_progress=show_progress,
+            desc=desc,
+            **kwargs,
+        )
+
+    def chat_with_continuation(
+        self,
+        dialogue_history: DialogueInput,
+        show_progress: bool = True,
+        desc: str = "Processing",
+        **kwargs: Any,
+    ) -> list[dict[str, Any]]:
         if self.use_api:
-            raise NotImplementedError("chat_with_continuation is only available with vLLM backend")
-        
-        return self.interface.chat_with_continuation(dialogue_history, show_progress=show_progress, desc=desc, **kwargs)
-    
+            raise NotImplementedError(
+                "chat_with_continuation is only available with the vLLM backend"
+            )
+        return self.interface.chat_with_continuation(
+            dialogue_history,
+            show_progress=show_progress,
+            desc=desc,
+            **kwargs,
+        )
+
     def extract_thinking(self, response_text: str) -> str:
-        """
-        Extract thinking process from response text.
-        Only available when using vLLM backend.
-        
-        Args:
-            response_text: The raw response text
-            
-        Returns:
-            Extracted thinking process
-        """
         if self.use_api:
-            # For API, just return the text as-is (or implement basic filtering)
             return response_text
-        
         return self.interface.extract_thinking(response_text)
-    
-    def free_memory(self):
-        if hasattr(self.interface, 'free_memory'):
-            self.interface.free_memory()
+
+    def close(self) -> None:
+        if self.interface is not None:
+            close = getattr(self.interface, "close", None)
+            if callable(close):
+                close()
+            else:
+                self.interface.free_memory()
+            self.interface = None
+
+    def free_memory(self) -> None:
+        """Backward-compatible cleanup alias used by BaseExperimentRunner."""
+
+        self.close()
+
+    def __enter__(self) -> UnifiedLLMInterface:
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
 
 
-if __name__ == "__main__":
-    model_name = 'openai/gpt-4o-mini'
-
-    interface = UnifiedLLMInterface(model_name, use_api=True)
-
-    dialogue_histories = [
-        [
-            {"role": "user", "content": "2+2=?"},
-        ],
-        [
-            {"role": "user", "content": "Hello!"},
-            {"role": "assistant", "content": "Hi! How can I help you today?"},
-            {"role": "user", "content": "Please breifly introduce OpenAI."},
-        ]
-    ]
-
-    results = interface.chat(dialogue_histories, desc="Testing API")
-
-    print(results)
+__all__ = ["APIInterface", "UnifiedLLMInterface"]

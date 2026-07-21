@@ -2,7 +2,8 @@
 
 ## Task Description
 
-You are asked to provide your opinion on whether you would take a specific action in support of or against a policy.
+This is an experimental vignette. The policy below was included in a hypothetical survey questionnaire, but no opinion result or percentage is provided.
+Please decide whether you would take the action after reading this neutral contextual statement.
 
 ## Policy Proposal
 "{POLICY_PROPOSAL}"

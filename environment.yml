@@ -1,0 +1,12 @@
+name: llm-belief-cpu
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - httpx=0.28.1
+  - python-dotenv=1.1.0
+  - tqdm=4.68.3
+  - pytest=8.4.1
+  - pip:
+      - ruff==0.15.22

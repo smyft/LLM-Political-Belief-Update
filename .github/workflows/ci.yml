@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  cpu-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install CPU and development dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Check dependency consistency
+        run: python -m pip check
+      - name: Lint
+        if: matrix.python-version == '3.12'
+        run: ruff check .
+      - name: Check formatting
+        if: matrix.python-version == '3.12'
+        run: ruff format --check .
+      - name: Run offline tests
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+        run: pytest

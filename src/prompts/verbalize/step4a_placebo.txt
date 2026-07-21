@@ -2,7 +2,8 @@
 
 ## Task Description
 
-You are asked to provide your opinion on the following policy proposal. Please analyze the policy and provide your final answer.
+This is an experimental vignette. The policy below was included in a hypothetical survey questionnaire, but no opinion result or percentage is provided.
+Please provide your own assessment after reading this neutral contextual statement.
 
 ## Policy Proposal
 "{POLICY_PROPOSAL}"
