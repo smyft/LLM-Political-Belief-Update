@@ -169,10 +169,13 @@ class VLLMInterface:
         self.llm = None
         self.tokenizer = None
         self._yes_no_candidate_map = None
+        self._continuation_preflight_complete = False
 
     def load_model(self):
         """Load the model into memory."""
         if self.llm is not None:
+            if self.tokenizer is None:
+                self.tokenizer = self.llm.get_tokenizer()
             print(f"Model {self.model_name} is already loaded.")
             return
 
@@ -218,6 +221,40 @@ class VLLMInterface:
                 "The installed vLLM is incompatible with continuation scoring; "
                 "missing LLM.chat parameters: " + ", ".join(missing)
             )
+
+    @staticmethod
+    def _build_continuation_sampling_params(candidate_token_ids: list[int], **kwargs):
+        """Construct the pinned vLLM continuation-scoring parameter contract."""
+
+        try:
+            return SamplingParams(
+                max_tokens=1,
+                logprob_token_ids=candidate_token_ids,
+                skip_special_tokens=False,
+                **kwargs,
+            )
+        except TypeError as exc:
+            raise RuntimeError(
+                "The installed vLLM SamplingParams is incompatible with continuation "
+                "scoring; logprob_token_ids support from vLLM 0.24 or a "
+                "compatible release is required."
+            ) from exc
+
+    def preflight_continuation_scoring(self) -> dict[int, str]:
+        """Load once and validate bounded continuation scoring without inference.
+
+        The returned candidate map is detached from the cached tokenizer-specific
+        map so callers cannot mutate later scoring behavior.
+        """
+
+        if self.llm is None or self.tokenizer is None:
+            self.load_model()
+        if not self._continuation_preflight_complete:
+            self._ensure_continuation_api()
+            candidate_map = self._get_yes_no_candidate_map()
+            self._build_continuation_sampling_params(list(candidate_map))
+            self._continuation_preflight_complete = True
+        return dict(self._get_yes_no_candidate_map())
 
     def _normalize_and_validate_dialogues(
         self,
@@ -388,8 +425,7 @@ class VLLMInterface:
         Returns:
             List of response dictionaries containing generated_text, logprobs, and probabilities
         """
-        if self.llm is None:
-            self.load_model()
+        candidate_map = self.preflight_continuation_scoring()
 
         # Normalize input to list of dialogues and validate OpenAI-style schema
         dialogues = self._normalize_and_validate_dialogues(
@@ -403,15 +439,14 @@ class VLLMInterface:
         if logprobs is not None and (not isinstance(logprobs, int) or logprobs < 1):
             raise ValueError("logprobs must be a positive integer when provided.")
 
-        candidate_map = self._get_yes_no_candidate_map()
         candidate_token_ids = list(candidate_map)
-        self._ensure_continuation_api()
 
         reserved_sampling_keys = {
             "temperature",
             "max_tokens",
             "seed",
             "logprobs",
+            "prompt_logprobs",
             "logprob_token_ids",
             "skip_special_tokens",
         }
@@ -423,22 +458,14 @@ class VLLMInterface:
             )
 
         # vLLM 0.24 returns exactly these bounded candidate logprobs plus the
-        # sampled token.  Do not set `logprobs`, especially not -1, because
-        # that would request a top-K or full-vocabulary distribution.
-        try:
-            sampling_params = SamplingParams(
-                temperature=temperature,
-                max_tokens=1,
-                seed=seed,
-                logprob_token_ids=candidate_token_ids,
-                skip_special_tokens=False,
-                **kwargs,
-            )
-        except TypeError as e:
-            raise RuntimeError(
-                "The installed vLLM SamplingParams does not support "
-                "logprob_token_ids; vLLM 0.24 or a compatible release is required."
-            ) from e
+        # sampled token. Do not set `logprobs`, especially not -1, because that
+        # would request a top-K or full-vocabulary distribution.
+        sampling_params = self._build_continuation_sampling_params(
+            candidate_token_ids,
+            temperature=temperature,
+            seed=seed,
+            **kwargs,
+        )
 
         outputs = self.llm.chat(
             dialogues,
@@ -509,6 +536,7 @@ class VLLMInterface:
         self.llm = None
         self.tokenizer = None
         self._yes_no_candidate_map = None
+        self._continuation_preflight_complete = False
         try:
             if llm is not None:
                 # Use a public close hook when a vLLM release provides one;

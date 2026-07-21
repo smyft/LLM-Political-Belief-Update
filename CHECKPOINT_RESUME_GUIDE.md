@@ -2,7 +2,7 @@
 
 ## 1. 适用范围
 
-本文说明 `verbalize` 与 `logprob` 两个实验 runner 的版本化 checkpoint 和恢复机制。默认结果目录为仓库根目录下的 `results/`。
+本文说明 `verbalize` 与 `logprob` 两个实验 runner 的版本化 checkpoint 和恢复机制。未传 `--results-dir` 时，无论从源码仓库还是 wheel 运行，默认结果目录都是**当前工作目录**下的 `results/`。从仓库根目录运行时，它自然就是仓库根下的 `results/`。本文的真实运行与恢复示例仍显式传入 `--results-dir`，避免依赖启动时所在目录。
 
 `data/proposal2action.py` 使用的是另一套相邻 `*.partial.json` 机制，不使用本文所述的 stage checkpoint。其 schema version 2 会校验模型、输入、prompt、选择计划、固定生成参数、规范化 OpenRouter endpoint，以及 generator 与统一 model interface 的源码 fingerprint；旧 schema 不兼容。该脚本的恢复方法见 README 的 “Generate proposal-to-action data” 部分。
 
@@ -10,7 +10,7 @@
 
 恢复不是“重新解释一批旧 JSON”，而是继续同一个不可变实验计划：
 
-- 每次新运行先生成唯一 `run_id` 和 `manifest.json`；
+- 每次新运行先生成抗碰撞的 `run_id` 和 `manifest.json`；
 - manifest 固定 pipeline、模型与后端配置、数据与 prompt 哈希、代码版本、选择计划、treatment 设计及每个 stage 的预期 `sample_id`；
 - 每个逻辑 stage 按 chunk 写入不可变 JSON 分片；
 - 恢复时严格验证 manifest、当前源码/数据/prompt 与 stage 依赖；
@@ -52,11 +52,11 @@ verbalize-20260720T123456.123456Z-a1b2c3d4
 logprob-20260720T123456.123456Z-a1b2c3d4
 ```
 
-时间使用 UTC，末尾随机片段避免同一时刻启动的运行碰撞。
+时间使用 UTC，末尾 UUID 随机片段使同一时刻启动的运行极难碰撞，但这不是数学上的绝对无碰撞保证；若目标 run 目录已经存在，严格的既有运行检查才是最终防线。`sample_id` 同样是基于规范化身份内容的 SHA-256 抗碰撞标识，不应描述为绝对不可能碰撞。
 
 ## 4. Manifest 固定了什么
 
-`manifest.json` 的 schema version 当前为 `1`，主要字段包括：
+`manifest.json` 与 stage chunks 的 checkpoint schema version 当前为 `2`。Version 1 与 version 2 明确不兼容：旧运行应保留作审计，不能由当前 loader 直接恢复或静默升级。主要字段包括：
 
 | 字段 | 含义 |
 | --- | --- |
@@ -72,7 +72,9 @@ logprob-20260720T123456.123456Z-a1b2c3d4
 
 创建运行前，`--max-base-units` 已经应用于 action-level 候选；Step 1/2 proposal units 随后才从所选 action units 去重得到。因此，小预算不会先触发全量 Step 1/2。
 
-Step 4 的固定条件、simulated consensus 占位、retest、placebo、replicate、seed 和顺序都在第一次模型调用前形成稳定 ID。实际 simulated-consensus 百分比和 `survey_surprise` 在 Step 1/2 完成后解析，但不会改变既有 ID。共识先在每个其他 persona 内平均有效 replicates，再对有贡献的 personas 等权；metadata 中 `consensus_persona_n` 与兼容字段 `consensus_n` 都表示贡献 persona 数，而不是有效 response 条数。
+Step 4 的固定条件、simulated consensus 占位、retest、placebo、replicate、seed 和顺序都在第一次模型调用前形成稳定 ID。实际 simulated-consensus 百分比和 `survey_surprise` 在 Step 1/2 完成后解析，但不会改变既有 ID。所有 treatment-planning 百分比使用统一的六位小数契约：fixed values 在去重前量化，condition、simulated consensus 与 `survey_surprise` 以同一精度保存，prompt 使用去掉尾随零的定点文本而非科学计数法。
+
+共识先在每个其他 persona 内平均有效 replicates，再对有贡献的 personas 等权；metadata 中 `consensus_persona_n` 与兼容字段 `consensus_n` 都表示贡献 persona 数，而不是有效 response 条数。logprob 记录只有在 `format_valid=true` 且 `sampled_choice` 为 `Yes`/`No` 时才贡献二元决策；即使条件 Yes/No 概率恰好相等，也按实际 sampled choice 计数，不用 argmax 制造伪标签。
 
 ## 5. Stage DAG
 
@@ -104,12 +106,13 @@ step1
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "run_id": "...",
   "run_fingerprint": "...",
   "stage": "step3",
   "chunk_index": 0,
   "written_at": "...+00:00",
+  "records_sha256": "<canonical-record-list SHA-256>",
   "records": []
 }
 ```
@@ -125,14 +128,15 @@ error_code, error_message, raw_response
 
 - 临时文件在同一目录创建，`fsync` 后通过原子 rename 发布；
 - 同一 run 的 manifest/chunk 写入由线程锁和 Unix 文件锁串行化；
-- 已存在 chunk 只有在内容完全一致时才幂等接受；不同内容会失败；
+- 已存在的同编号 chunk 先必须通过完整校验；其规范化 record 列表与待写 record 列表一致时才幂等接受，record 内容不同则失败；
 - 同一个 `sample_id` 不得出现在多个 chunk；
 - manifest 一旦已有任何 chunk，就不能替换为不同 manifest；
+- loader 校验 `records_sha256`，并对 record 的 stage、pipeline、metadata、status 与 value 进行语义验证；digest 一致本身不能替代这些检查；
 - loader 拒绝损坏 JSON、重复 key、`NaN`/`Infinity`、错误 stage、错误 fingerprint、未知/重复 ID 和错误 chunk 文件名；run 目录、manifest、lock、stage 目录、chunk 文件与 SQLite sample index 都不允许是 symbolic link。
 
-每个 stage 还维护一个派生的 `.sample-index.sqlite3`，用于在追加新 chunk 时检查历史 `sample_id`，避免每次写入前全量重读所有旧 shards。它不是 checkpoint 事实来源：manifest 与不可变 JSON chunks 才是权威数据。索引缺失、损坏或与 chunk 文件集合不同步时会从 JSON 自动重建；在没有 writer 运行时可以安全删除。
+每个 stage 还维护一个派生的 `.sample-index.sqlite3` 来辅助 duplicate-ID 检查。它不是 checkpoint 事实来源：manifest 与不可变 JSON chunks 才是权威数据。冷启动，或当前 `CheckpointStore` 之外改变了 shard/index 签名时，实现会重读并严格验证全部历史 JSON shards，再把权威 chunk/sample 映射与 SQLite 内容比较；索引缺失、损坏或任何不一致都会从 JSON 自动重建。同一 `CheckpointStore` 实例中，未变化的 warm authority cache 会先校验文件签名和索引摘要元数据，正常追加无需反复读取历史 shard 内容；任何不匹配都退回 JSON 权威全量扫描。在没有 writer 运行时可以安全删除索引。
 
-不要手工编辑、移动或合并 manifest 与 JSON chunks。手工改动通常会使严格验证失败，而不是被静默接受；SQLite 索引是上述规则中唯一可删除并重建的派生文件。
+不要手工编辑、移动或合并 manifest 与 JSON chunks。手工改动通常会使严格验证失败，而不是被静默接受。SQLite 索引被明确设计为可从 JSON shards 重建的派生缓存；只有在确认没有 writer 运行时才能删除它。`.checkpoint.lock` 也不是记录事实来源，但它是并发协调文件，不应在 writer 运行期间操作。
 
 ## 7. 开始运行
 
@@ -147,6 +151,8 @@ python -m src.experiment.verbalize_experiment_runner \
 ```
 
 dry-run 的 logical sample counts 是计划中的精确数量；backend sequence counts 是保守上界。若前序输出无效，simulated-consensus cell 或 logprob continuation 可能不调用 backend，因此实际请求数可以更少。
+
+两个 CLI 都把 `--dry-run` 与 `--resume-from` 定义为显式互斥；不能用 dry-run 静默忽略一个恢复请求。
 
 真正运行后，终端会打印最终文件路径，其中含 `run_id`：
 
@@ -167,6 +173,8 @@ python -m src.experiment.logprob_experiment_runner \
   --max-base-units 12 \
   --results-dir results
 ```
+
+logprob runner 在第一个可执行 chat（包括 Step 2）之前初始化 backend 并只运行一次 `preflight_continuation_scoring()`。continuation/tokenizer/API 不兼容是 run-level fatal：不会转成每样本 `ERROR`，也不会继续后续 chunk/stage；没有可执行 assignment 时不会初始化。preflight 成功后的普通 chat/continuation 运行异常仍按样本记录 `ERROR`。phase 1 的 `finish_reason=length` 记为 `INVALID/phase1_truncated`，保守识别到显式最终 Yes/No 时记为 `INVALID/phase1_contains_final_answer`，两者都不发起 continuation。
 
 这些 revision flags 只适用于 local vLLM，与 `--use-api` 同用会被拒绝；hosted API 版本必须通过 provider model identifier 选择。如果 local model、tokenizer 与 remote code 使用同一个不可变 revision，只传 `--model-revision` 即可；`--tokenizer-revision` 和 `--code-revision` 默认继承它。三者不同时应分别指定。启用 `--trust-remote-code` 时必须至少通过 `--code-revision` 或 `--model-revision` 固定所执行的代码，否则 runner 会拒绝启动。
 
@@ -230,7 +238,7 @@ python -m src.experiment.logprob_experiment_runner \
   --resume-step step3
 ```
 
-两个 CLI 在提供 `--resume-from` 时都可以省略 `--model`；只有新 run 和 dry-run 要求显式模型。恢复过程中，manifest 会恢复并覆盖模型、backend、revision、treatment、seed、replicate 等实验配置，再重建并核对 fingerprint。重新传入这些实验参数不会把旧 run 改成新设计。
+两个 CLI 在提供 `--resume-from` 时都可以省略 `--model`；只有新 run 和 dry-run 要求显式模型。恢复必须从尚未初始化或注入 backend 的 fresh runner 开始；测试或嵌入程序如需自定义 backend，应传入 lazy factory，让 manifest 配置先恢复再实例化。恢复过程中，manifest 会恢复并覆盖模型、backend、revision、treatment、seed、replicate 等实验配置，再重建并核对 fingerprint。重新传入这些实验参数不会把旧 run 改成新设计。
 
 只有少数操作性参数不属于实验身份，例如当前 `--results-dir`、`--chunk-size` 和进度显示。`--results-dir` 必须指向包含目标 `checkpoints/<run_id>` 的目录。
 
@@ -251,15 +259,18 @@ python -m src.experiment.logprob_experiment_runner \
 恢复会检查：
 
 1. `run_id` 格式和路径不能逃逸 checkpoint 根目录；
-2. manifest schema、嵌套 fingerprint 与总 fingerprint；
+2. manifest/chunk schema 必须为 v2（v1 明确不兼容）、嵌套 fingerprint 与总 fingerprint；
 3. pipeline 必须与所用 runner 一致；
 4. 当前 Git/source version 必须与 manifest 一致；
-5. 当前数据文件与 prompt 内容哈希必须一致；
+5. 当前数据文件的精确已验证 byte snapshots、对应哈希与 prompt 内容哈希必须一致；
 6. 选择计划、treatment 设计和所有 expected sample IDs 必须可精确重建；
 7. 所有前置 stage 必须完整；
-8. 所有 chunk 必须属于同一 run、fingerprint 和 stage；
-9. 已保存 record 的 metadata 必须与当前重建 assignment 精确一致；
-10. 不允许缺失、未知、重复或 wrong-stage records，也不跟随 run/manifest/lock/stage/chunk/index symbolic links。
+8. 所有 chunk 必须属于同一 run、fingerprint 和 stage，`records_sha256` 必须匹配；
+9. 已保存 record 的 metadata 必须与当前重建 assignment 精确一致，status/value 还要通过 pipeline/stage 语义验证；
+10. SQLite index 必须与权威 JSON shards 一致，否则自动重建；
+11. 不允许缺失、未知、重复或 wrong-stage records，也不跟随 run/manifest/lock/stage/chunk/index symbolic links。
+
+DataLoader 从同一份 bytes 完成解析、严格验证与 SHA-256，只有全部成功后才发布缓存；对外返回 defensive copies。manifest 创建/恢复会再次检查当前文件是否相对已缓存 snapshot 漂移。若发生漂移，应创建 fresh runner，不得让旧缓存与新磁盘哈希混合。
 
 因此，下列修改后通常不能恢复旧 run：
 

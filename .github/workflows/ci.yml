@@ -35,4 +35,4 @@ jobs:
         env:
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
-        run: pytest
+        run: python -m pytest

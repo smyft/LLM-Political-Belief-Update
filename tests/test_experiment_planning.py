@@ -3,10 +3,12 @@ import unittest
 from src.experiment.planning import (
     ActionUnit,
     ProposalUnit,
+    TreatmentCondition,
     build_baseline_assignments,
     build_selection_plan,
     build_treatment_plan,
     compute_survey_surprise,
+    format_presented_percentage,
     leave_one_persona_out_consensus,
 )
 
@@ -116,6 +118,22 @@ class TreatmentPlanningTests(unittest.TestCase):
         )
         self.assertEqual(percentage, 50.0)
         self.assertEqual(contributing_personas, 2)
+
+    def test_leave_one_out_consensus_uses_presented_percentage_precision(self):
+        beliefs = {
+            ("target", "economy", "A policy"): 1,
+            ("peer-a", "economy", "A policy"): 1,
+            ("peer-b", "economy", "A policy"): 0,
+            ("peer-c", "economy", "A policy"): 0,
+        }
+
+        percentage, contributing_personas = leave_one_persona_out_consensus(
+            beliefs,
+            ProposalUnit("target", "economy", "A policy"),
+        )
+
+        self.assertEqual(percentage, 33.333333)
+        self.assertEqual(contributing_personas, 3)
 
     def test_step4a_is_proposal_level_and_step4b_remains_action_level(self):
         plan = build_treatment_plan(
@@ -285,6 +303,32 @@ class TreatmentPlanningTests(unittest.TestCase):
             leave_one_persona_out_consensus(
                 bad,
                 ProposalUnit("persona-a", "economy", "A policy"),
+            )
+
+    def test_presented_percentages_share_storage_format_and_surprise_precision(self):
+        condition = TreatmentCondition(
+            kind="fixed_hypothetical_survey",
+            source="hypothetical_survey",
+            percentage=12.3456789,
+        )
+
+        self.assertEqual(condition.percentage, 12.345679)
+        self.assertEqual(format_presented_percentage(condition.percentage), "12.345679")
+        self.assertEqual(format_presented_percentage(12.3400004), "12.34")
+        self.assertEqual(format_presented_percentage(0.000001), "0.000001")
+        self.assertNotIn("e", format_presented_percentage(0.000001).casefold())
+        self.assertEqual(
+            compute_survey_surprise(70.1234567, 25.0000002),
+            45.123457,
+        )
+
+    def test_fixed_percentages_must_be_unique_after_quantization(self):
+        with self.assertRaisesRegex(ValueError, "unique after quantization"):
+            build_treatment_plan(
+                self.selection,
+                valid_binary_beliefs=self.beliefs,
+                step2_predictions=self.predictions,
+                fixed_percentages=(10.0000001, 10.0000002),
             )
 
 

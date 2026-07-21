@@ -10,7 +10,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from src.experiment.checkpoints import CheckpointValidationError
-from src.experiment.core import ResultStatus
+from src.experiment.core import (
+    ExperimentRecord,
+    ResultStatus,
+    canonical_json,
+    sha256_text,
+)
 from src.experiment.planning import (
     StageAssignment,
     TreatmentAssignment,
@@ -311,6 +316,29 @@ class VerbalizeRunnerTests(unittest.TestCase):
         self.assertEqual(plan["logical_sample_counts"]["step4b"], 3)
         self.assertEqual(factory_calls, [])
 
+    def test_data_change_after_planning_fails_before_manifest_or_model_call(self):
+        fake = FakeLLM()
+        runner = self.runner(
+            fake,
+            fixed_percentages=[50],
+            include_simulated_consensus=False,
+            include_retest=False,
+            include_placebo=False,
+        )
+        runner.dry_run(personas=["none"], max_base_units=1)
+
+        proposal_path = self.data_dir / "proposal_actions.json"
+        proposals = json.loads(proposal_path.read_text(encoding="utf-8"))
+        proposals["category"][0]["political_proposal"] = "Changed policy"
+        proposal_path.write_text(json.dumps(proposals), encoding="utf-8")
+
+        with self.assertRaisesRegex(
+            ValueError, "changed after its validated data snapshot"
+        ):
+            runner.run_experiments(personas=["none"], max_base_units=1)
+        self.assertEqual(fake.calls, [])
+        self.assertFalse((self.results_dir / "checkpoints").exists())
+
     def test_full_run_embeds_manifest_status_summary_and_resume_is_idempotent(self):
         fake = FakeLLM()
         runner = self.runner(
@@ -356,6 +384,12 @@ class VerbalizeRunnerTests(unittest.TestCase):
         chunk_path = next(step4a_dir.glob("chunk_*.json"))
         chunk_payload = json.loads(chunk_path.read_text(encoding="utf-8"))
         chunk_payload["records"][0]["metadata"]["distribution_percentage"] = 75.0
+        # Recompute the unkeyed integrity digest so this test reaches the
+        # independent assignment-reconstruction guard. Digest-only tampering
+        # is covered by the checkpoint-store tests.
+        chunk_payload["records_sha256"] = sha256_text(
+            canonical_json(chunk_payload["records"])
+        )
         chunk_path.write_text(json.dumps(chunk_payload), encoding="utf-8")
 
         stale_resume = VerbalizeExperimentRunner(
@@ -373,6 +407,71 @@ class VerbalizeRunnerTests(unittest.TestCase):
                 runner.active_manifest.run_id,
                 "step4a",
             )
+
+    def test_resume_rejects_an_existing_or_injected_backend(self):
+        original = self.runner(
+            FakeLLM(),
+            model_name="model-B",
+            fixed_percentages=[50],
+            include_simulated_consensus=False,
+            include_retest=False,
+            include_placebo=False,
+        )
+        original.run_experiments(personas=["none"], max_base_units=1)
+
+        wrong_backend = FakeLLM()
+        resumed = self.runner(wrong_backend, model_name="model-A")
+        with self.assertRaisesRegex(
+            CheckpointValidationError,
+            "refuses to reuse an existing or injected backend",
+        ):
+            resumed.run_experiments_from_step(
+                original.active_manifest.run_id,
+                "step4b",
+            )
+        self.assertEqual(wrong_backend.calls, [])
+
+    def test_logprob_binary_decision_uses_sampled_choice_not_probability_argmax(self):
+        metadata = {"persona": "none", "category": "category", "proposal": "P"}
+        sampled_no = ExperimentRecord(
+            sample_id="sampled-no",
+            stage="step1",
+            metadata=metadata,
+            status=ResultStatus.VALID,
+            value={
+                "probabilities": {"Yes": 0.9, "No": 0.1},
+                "sampled_choice": "No",
+                "format_valid": True,
+            },
+        )
+        tied_but_sampled_yes = ExperimentRecord(
+            sample_id="sampled-yes",
+            stage="step1",
+            metadata=metadata,
+            status=ResultStatus.VALID,
+            value={
+                "probabilities": {"Yes": 0.5, "No": 0.5},
+                "sampled_choice": "Yes",
+                "format_valid": True,
+            },
+        )
+        invalid_format = ExperimentRecord(
+            sample_id="invalid-format",
+            stage="step1",
+            metadata=metadata,
+            status=ResultStatus.VALID,
+            value={
+                "probabilities": {"Yes": 0.9, "No": 0.1},
+                "sampled_choice": "Yes",
+                "format_valid": False,
+            },
+        )
+
+        self.assertEqual(VerbalizeExperimentRunner._binary_decision(sampled_no), 0)
+        self.assertEqual(
+            VerbalizeExperimentRunner._binary_decision(tied_but_sampled_yes), 1
+        )
+        self.assertIsNone(VerbalizeExperimentRunner._binary_decision(invalid_format))
 
     def test_vllm_mode_ignores_unrelated_bad_openrouter_environment_and_accepts_local_path(
         self,

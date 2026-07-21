@@ -20,23 +20,39 @@ from src.experiment.planning import (
 
 class FakeBackend:
     def __init__(
-        self, *, chat_results=None, continuation_results=None, chat_error=None
+        self,
+        *,
+        chat_results=None,
+        continuation_results=None,
+        chat_error=None,
+        preflight_error=None,
     ):
         self.chat_results = list(chat_results or [])
         self.continuation_results = list(continuation_results or [])
         self.chat_error = chat_error
+        self.preflight_error = preflight_error
+        self.preflight_calls = 0
         self.chat_calls = []
         self.continuation_calls = []
+        self.call_order = []
         self.closed = False
+
+    def preflight_continuation_scoring(self):
+        self.preflight_calls += 1
+        self.call_order.append("preflight")
+        if self.preflight_error is not None:
+            raise self.preflight_error
 
     def chat(self, **kwargs):
         self.chat_calls.append(kwargs)
+        self.call_order.append("chat")
         if self.chat_error is not None:
             raise self.chat_error
         return self.chat_results.pop(0)
 
     def chat_with_continuation(self, **kwargs):
         self.continuation_calls.append(kwargs)
+        self.call_order.append("continuation")
         return self.continuation_results.pop(0)
 
     def close(self):
@@ -53,6 +69,7 @@ class AdaptiveFakeBackend(FakeBackend):
 
     def chat(self, **kwargs):
         self.chat_calls.append(kwargs)
+        self.call_order.append("chat")
         dialogues = kwargs["dialogue_history"]
         self.chat_batch_sizes.append(len(dialogues))
         responses = []
@@ -68,6 +85,7 @@ class AdaptiveFakeBackend(FakeBackend):
 
     def chat_with_continuation(self, **kwargs):
         self.continuation_calls.append(kwargs)
+        self.call_order.append("continuation")
         count = len(kwargs["dialogue_history"])
         self.continuation_batch_sizes.append(count)
         return [score_response() for _ in range(count)]
@@ -204,6 +222,60 @@ def test_prompt_specs_validate_every_exact_placeholder_set(tmp_path):
         broken.load_prompt_templates()
 
 
+@pytest.mark.parametrize("stage", ["step1", "step2"])
+def test_preflight_failure_is_fatal_before_any_chat(stage):
+    backend = FakeBackend(
+        preflight_error=RuntimeError("continuation scoring is incompatible")
+    )
+    runner = make_runner(backend)
+
+    with pytest.raises(RuntimeError, match="continuation scoring is incompatible"):
+        runner._execute_stage_chunk(stage, [baseline_assignment(stage)])
+
+    assert backend.preflight_calls == 1
+    assert backend.chat_calls == []
+    assert backend.continuation_calls == []
+    assert backend.call_order == ["preflight"]
+
+
+def test_preflight_runs_once_before_step2_and_binary_chat():
+    backend = FakeBackend(
+        chat_results=[
+            [{"generated_text": json.dumps({"analysis": "estimate", "answer": 47.5})}],
+            [{"generated_text": "bounded analysis", "finish_reason": "stop"}],
+        ],
+        continuation_results=[[score_response()]],
+    )
+    runner = make_runner(backend)
+
+    step2 = runner._execute_stage_chunk("step2", [baseline_assignment("step2")])[0]
+    step1 = runner._execute_stage_chunk("step1", [baseline_assignment("step1")])[0]
+
+    assert step2.status is ResultStatus.VALID
+    assert step1.status is ResultStatus.VALID
+    assert backend.preflight_calls == 1
+    assert backend.call_order == ["preflight", "chat", "chat", "continuation"]
+
+
+def test_preflight_is_bound_to_backend_identity_and_reset_by_cleanup():
+    first = FakeBackend()
+    second = FakeBackend()
+    runner = make_runner(first)
+
+    assert runner._preflight_continuation_scoring() is first
+    assert runner._preflight_continuation_scoring() is first
+    runner.llm_interface = second
+    assert runner._preflight_continuation_scoring() is second
+
+    assert first.preflight_calls == 1
+    assert second.preflight_calls == 1
+
+    runner.cleanup()
+    runner.llm_interface = second
+    assert runner._preflight_continuation_scoring() is second
+    assert second.preflight_calls == 2
+
+
 def test_binary_stage_passes_generated_analysis_into_bounded_continuation():
     backend = FakeBackend(
         chat_results=[
@@ -234,6 +306,87 @@ def test_binary_stage_passes_generated_analysis_into_bounded_continuation():
     assert continuation["temperature"] == 0.0
     assert "logprobs" not in continuation
     assert backend.chat_calls[0]["temperature"] == 0.7
+
+
+@pytest.mark.parametrize(
+    "analysis_text",
+    [
+        "Yes",
+        "The expected benefits outweigh the costs.\nYes.",
+        "<think>The expected costs dominate.</think>**No**",
+        "Yes, because the expected benefits outweigh the costs.",
+        "After weighing the evidence, the final answer is No.",
+        "The considerations favor the proposal. Therefore, Yes.",
+        json.dumps({"analysis": "done", "answer": "Yes"}),
+        "```json\n" + json.dumps({"answer": False}) + "\n```",
+    ],
+)
+def test_phase1_explicit_final_answer_is_invalid_without_continuation(analysis_text):
+    backend = FakeBackend(
+        chat_results=[[{"generated_text": analysis_text, "finish_reason": "stop"}]]
+    )
+    runner = make_runner(backend)
+
+    record = runner._execute_stage_chunk("step1", [baseline_assignment("step1")])[0]
+
+    assert record.status is ResultStatus.INVALID
+    assert record.error_code == "phase1_contains_final_answer"
+    assert record.raw_response == analysis_text
+    assert backend.continuation_calls == []
+
+
+def test_phase1_truncation_is_invalid_without_continuation():
+    backend = FakeBackend(
+        chat_results=[
+            [{"generated_text": "unfinished analysis", "finish_reason": "length"}]
+        ]
+    )
+    runner = make_runner(backend)
+
+    record = runner._execute_stage_chunk("step1", [baseline_assignment("step1")])[0]
+
+    assert record.status is ResultStatus.INVALID
+    assert record.error_code == "phase1_truncated"
+    assert record.raw_response == "unfinished analysis"
+    assert backend.continuation_calls == []
+
+
+def test_phase1_finish_reason_schema_error_does_not_request_continuation():
+    backend = FakeBackend(
+        chat_results=[[{"generated_text": "analysis", "finish_reason": 7}]]
+    )
+    runner = make_runner(backend)
+
+    record = runner._execute_stage_chunk("step1", [baseline_assignment("step1")])[0]
+
+    assert record.status is ResultStatus.ERROR
+    assert record.error_code == "phase1_response_schema_error"
+    assert "finish_reason" in record.error_message
+    assert backend.continuation_calls == []
+
+
+def test_phase1_can_discuss_yes_and_no_without_being_treated_as_a_final_answer():
+    backend = FakeBackend(
+        chat_results=[
+            [
+                {
+                    "generated_text": (
+                        "A Yes response emphasizes benefits, while a No response "
+                        "emphasizes costs. There is no evidence that either "
+                        "consideration settles the answer."
+                    ),
+                    "finish_reason": "stop",
+                }
+            ]
+        ],
+        continuation_results=[[score_response()]],
+    )
+    runner = make_runner(backend)
+
+    record = runner._execute_stage_chunk("step1", [baseline_assignment("step1")])[0]
+
+    assert record.status is ResultStatus.VALID
+    assert len(backend.continuation_calls) == 1
 
 
 def test_non_candidate_sample_is_invalid_but_retains_bounded_score_for_diagnostics():
@@ -268,6 +421,45 @@ def test_format_valid_must_agree_with_sampled_choice():
     assert record.status is ResultStatus.ERROR
     assert record.error_code == "phase2_response_schema_error"
     assert "agree with sampled_choice" in record.error_message
+
+    declared_invalid = FakeBackend(
+        chat_results=[[{"generated_text": "analysis"}]],
+        continuation_results=[
+            [
+                {
+                    "valid": False,
+                    "error": "backend_declared_invalid",
+                    "sampled_choice": None,
+                    "format_valid": True,
+                }
+            ]
+        ],
+    )
+    malformed_runner = make_runner(declared_invalid)
+
+    malformed_record = malformed_runner._execute_stage_chunk(
+        "step1", [baseline_assignment("step1")]
+    )[0]
+
+    assert malformed_record.status is ResultStatus.ERROR
+    assert malformed_record.error_code == "phase2_response_schema_error"
+    assert "agree with sampled_choice" in malformed_record.error_message
+
+
+def test_cross_inconsistent_score_is_per_sample_error_before_checkpoint_write():
+    inconsistent = score_response()
+    inconsistent["probabilities"] = {"Yes": 0.9, "No": 0.1}
+    backend = FakeBackend(
+        chat_results=[[{"generated_text": "analysis"}]],
+        continuation_results=[[inconsistent]],
+    )
+    runner = make_runner(backend)
+
+    record = runner._execute_stage_chunk("step1", [baseline_assignment("step1")])[0]
+
+    assert record.status is ResultStatus.ERROR
+    assert record.error_code == "phase2_response_schema_error"
+    assert "conditional probabilities do not match" in record.error_message
 
 
 def test_step2_uses_strict_percentage_json_and_never_calls_continuation():
@@ -305,6 +497,7 @@ def test_unavailable_simulated_consensus_is_invalid_without_any_model_call():
 
     assert record.status is ResultStatus.INVALID
     assert record.error_code == "simulated_consensus_unavailable"
+    assert backend.preflight_calls == 0
     assert backend.chat_calls == []
     assert backend.continuation_calls == []
 
@@ -331,6 +524,15 @@ def test_treatment_prompt_contracts_are_distinct_and_retest_reuses_baseline():
     assert "hypothetical" in fixed.casefold()
     assert "not a verified real-world poll" in fixed
     assert "70%" in fixed
+
+    tiny_fixed = runner._render_phase1_prompt(
+        "step4a",
+        treatment_assignment(
+            "step4a", "fixed_hypothetical_survey", percentage=0.000001
+        ),
+    )
+    assert "0.000001%" in tiny_fixed
+    assert "e-" not in tiny_fixed.casefold()
 
     simulated = runner._render_phase1_prompt(
         "step4a",
@@ -588,4 +790,14 @@ def test_main_uses_passed_argv_not_process_argv(monkeypatch, tmp_path):
             ]
         )
         == 0
+    )
+
+
+def test_dry_run_and_resume_are_mutually_exclusive(capsys):
+    with pytest.raises(SystemExit) as exc_info:
+        main(["--dry-run", "--resume-from", "existing-run"])
+
+    assert exc_info.value.code == 2
+    assert (
+        "--dry-run and --resume-from are mutually exclusive" in capsys.readouterr().err
     )

@@ -10,14 +10,18 @@ leave-one-persona-out simulated consensus, and survey surprise.
 from __future__ import annotations
 
 import hashlib
+import math
 import random
 from dataclasses import dataclass
+from decimal import Decimal, ROUND_HALF_EVEN
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 from .core import stable_sample_id
 
 
 FIXED_DISTRIBUTION_PERCENTAGES: Tuple[float, ...] = (10.0, 30.0, 50.0, 70.0, 90.0)
+PRESENTED_PERCENTAGE_DECIMAL_PLACES = 6
+_PRESENTED_PERCENTAGE_QUANTUM = Decimal("0.000001")
 
 ProposalKey = Tuple[str, str, str]
 BaseKey = Tuple[str, str, str, str, str]
@@ -38,9 +42,29 @@ def _validate_percentage(name: str, value: float) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise TypeError(f"{name} must be numeric")
     normalized = float(value)
-    if not 0.0 <= normalized <= 100.0:
+    if not math.isfinite(normalized) or not 0.0 <= normalized <= 100.0:
         raise ValueError(f"{name} must be between 0 and 100")
-    return normalized
+    return _quantize_decimal(normalized)
+
+
+def _quantize_decimal(value: float) -> float:
+    quantized = float(
+        Decimal(str(float(value))).quantize(
+            _PRESENTED_PERCENTAGE_QUANTUM,
+            rounding=ROUND_HALF_EVEN,
+        )
+    )
+    # Keep serialized metadata and prompt rendering free of negative zero.
+    return 0.0 if quantized == 0.0 else quantized
+
+
+def format_presented_percentage(value: float) -> str:
+    """Format one validated percentage under the shared prompt precision contract."""
+
+    normalized = _validate_percentage("percentage", value)
+    return f"{normalized:.{PRESENTED_PERCENTAGE_DECIMAL_PLACES}f}".rstrip("0").rstrip(
+        "."
+    )
 
 
 @dataclass(frozen=True, order=True)
@@ -329,7 +353,11 @@ class TreatmentCondition:
         _require_non_empty_string("kind", self.kind)
         _require_non_empty_string("source", self.source)
         if self.percentage is not None:
-            _validate_percentage("percentage", self.percentage)
+            object.__setattr__(
+                self,
+                "percentage",
+                _validate_percentage("percentage", self.percentage),
+            )
         if self.consensus_n is not None:
             _validate_positive_int("consensus_n", self.consensus_n)
 
@@ -474,7 +502,11 @@ def leave_one_persona_out_consensus(
 
     if not persona_means:
         return None, 0
-    return 100.0 * sum(persona_means) / len(persona_means), len(persona_means)
+    percentage = 100.0 * sum(persona_means) / len(persona_means)
+    return (
+        _validate_percentage("simulated consensus percentage", percentage),
+        len(persona_means),
+    )
 
 
 def compute_survey_surprise(
@@ -489,7 +521,7 @@ def compute_survey_surprise(
     predicted = _validate_percentage(
         "step2_predicted_percentage", step2_predicted_percentage
     )
-    return treatment - predicted
+    return _quantize_decimal(treatment - predicted)
 
 
 def _normalize_fixed_percentages(values: Sequence[float]) -> Tuple[float, ...]:
@@ -499,7 +531,10 @@ def _normalize_fixed_percentages(values: Sequence[float]) -> Tuple[float, ...]:
     if not normalized:
         raise ValueError("at least one fixed percentage is required")
     if len(set(normalized)) != len(normalized):
-        raise ValueError("fixed percentages must be unique")
+        raise ValueError(
+            "fixed percentages must be unique after quantization to "
+            f"{PRESENTED_PERCENTAGE_DECIMAL_PLACES} decimal places"
+        )
     return normalized
 
 

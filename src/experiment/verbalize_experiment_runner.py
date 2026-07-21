@@ -12,11 +12,14 @@ from __future__ import annotations
 import argparse
 import math
 import sys
-from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from src.data.data_loader import instantiate_prompt
-from src.experiment.base_runner import BaseExperimentRunner, print_json
+from src.experiment.base_runner import (
+    BaseExperimentRunner,
+    default_results_directory,
+    print_json,
+)
 from src.experiment.checkpoints import CheckpointValidationError
 from src.experiment.core import (
     ExperimentRecord,
@@ -26,7 +29,11 @@ from src.experiment.core import (
     parse_percentage_response,
     parse_yes_no_response,
 )
-from src.experiment.planning import StageAssignment, TreatmentAssignment
+from src.experiment.planning import (
+    StageAssignment,
+    TreatmentAssignment,
+    format_presented_percentage,
+)
 
 
 class VerbalizeExperimentRunner(BaseExperimentRunner):
@@ -71,21 +78,12 @@ class VerbalizeExperimentRunner(BaseExperimentRunner):
         ),
     }
 
-    @staticmethod
-    def _percentage_text(value: float) -> str:
-        if not isinstance(value, (int, float)) or isinstance(value, bool):
-            raise TypeError("distribution percentage must be numeric")
-        number = float(value)
-        if not math.isfinite(number) or not 0.0 <= number <= 100.0:
-            raise ValueError("distribution percentage must be finite and in [0, 100]")
-        return f"{number:g}"
-
     def _distribution_text(self, assignment: TreatmentAssignment) -> str | None:
         condition = assignment.condition
         if condition.kind == "fixed_hypothetical_survey":
             if condition.percentage is None:
                 return None
-            percentage = self._percentage_text(condition.percentage)
+            percentage = format_presented_percentage(condition.percentage)
             return (
                 "In this hypothetical survey vignette, "
                 f"{percentage}% of respondents are described as believing this "
@@ -94,7 +92,7 @@ class VerbalizeExperimentRunner(BaseExperimentRunner):
         if condition.kind == "simulated_persona_consensus":
             if condition.percentage is None or condition.consensus_n is None:
                 return None
-            percentage = self._percentage_text(condition.percentage)
+            percentage = format_presented_percentage(condition.percentage)
             return (
                 f"Across {condition.consensus_n} other simulated persona conditions "
                 "(excluding the current persona), after averaging valid replicates "
@@ -474,7 +472,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     parser = build_parser()
     args = parser.parse_args(argv)
-    default_results = Path(__file__).resolve().parents[2] / "results"
+    if args.dry_run and args.resume_from:
+        parser.error("--dry-run and --resume-from are mutually exclusive")
+    default_results = default_results_directory()
     if args.list_checkpoints:
         print_json(
             VerbalizeExperimentRunner.list_checkpoint_runs(

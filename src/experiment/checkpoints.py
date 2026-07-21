@@ -8,6 +8,7 @@ duplicate, unknown, and missing-record checks before resumption or compilation.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sqlite3
@@ -19,10 +20,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
-from .core import ExperimentRecord, canonical_json, hash_mapping
+from .core import (
+    ExperimentRecord,
+    ResultStatus,
+    canonical_json,
+    hash_mapping,
+    sha256_text,
+)
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 LOGICAL_STAGES: Tuple[str, ...] = ("step1", "step2", "step3", "step4a", "step4b")
 STAGE_DEPENDENCIES: Mapping[str, Tuple[str, ...]] = {
     "step1": (),
@@ -34,12 +41,375 @@ STAGE_DEPENDENCIES: Mapping[str, Tuple[str, ...]] = {
 _SAFE_RUN_ID_RE = re.compile(r"\A[A-Za-z0-9_.-]+\Z")
 _LOCKS_GUARD = threading.Lock()
 _PROCESS_LOCKS: Dict[str, threading.Lock] = {}
-_INDEX_SCHEMA_VERSION = "2"
-_SQLITE_QUERY_BATCH_SIZE = 500
+_INDEX_SCHEMA_VERSION = "3"
+_BINARY_STAGES = frozenset({"step1", "step3", "step4a", "step4b"})
+_SUPPORTED_PIPELINES = frozenset({"verbalize", "logprob"})
+_SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+_LOGPROB_SCORE_FIELDS = frozenset(
+    {
+        "probabilities",
+        "label_logprobs",
+        "candidate_mass",
+        "residual_mass",
+        "candidates",
+        "sampled_token_id",
+        "sampled_choice",
+        "format_valid",
+        "analysis_text",
+        "analysis_text_kind",
+        "estimator",
+        "conditional_on_candidate_set",
+        "scoring_temperature",
+        "finish_reason",
+    }
+)
+
+
+_FileSignature = Tuple[int, int, int, int, int, int]
+
+
+@dataclass
+class _StageAuthorityCache:
+    """Store-local view derived exclusively from validated JSON shards.
+
+    The SQLite database is deliberately absent from the authoritative fields.
+    File signatures only decide whether this cached view may be reused; a cold
+    store or any externally visible filesystem change falls back to reloading
+    and validating every JSON shard.
+    """
+
+    chunk_signatures: Dict[str, _FileSignature]
+    chunk_sample_ids: Dict[str, Tuple[str, ...]]
+    sample_chunks: Dict[str, str]
+    index_signature: _FileSignature
 
 
 class CheckpointValidationError(ValueError):
     """Raised when a manifest or checkpoint violates reproducibility rules."""
+
+
+def _finite_number(
+    value: Any,
+    name: str,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise CheckpointValidationError(f"{name} must be numeric and not boolean")
+    try:
+        number = float(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise CheckpointValidationError(f"{name} must be finite") from exc
+    if not math.isfinite(number):
+        raise CheckpointValidationError(f"{name} must be finite")
+    if minimum is not None and number < minimum:
+        raise CheckpointValidationError(f"{name} must be at least {minimum:g}")
+    if maximum is not None and number > maximum:
+        raise CheckpointValidationError(f"{name} must be at most {maximum:g}")
+    return number
+
+
+def _logsumexp(values: Sequence[float]) -> float:
+    maximum = max(values)
+    return maximum + math.log(math.fsum(math.exp(value - maximum) for value in values))
+
+
+def _validate_percentage_value(value: Any, *, field: str) -> None:
+    _finite_number(value, field, minimum=0.0, maximum=100.0)
+
+
+def validate_logprob_value(value: Any, *, sample_id: str) -> None:
+    """Validate the complete persisted value contract for a VALID logprob record."""
+
+    prefix = f"record {sample_id} logprob value"
+    if not isinstance(value, Mapping):
+        raise CheckpointValidationError(f"{prefix} must be an object")
+    missing = _LOGPROB_SCORE_FIELDS.difference(value)
+    if missing:
+        raise CheckpointValidationError(
+            f"{prefix} is missing field: {sorted(missing)[0]}"
+        )
+
+    probabilities = value["probabilities"]
+    if not isinstance(probabilities, Mapping) or set(probabilities) != {"Yes", "No"}:
+        raise CheckpointValidationError(
+            f"{prefix} probabilities must contain exactly Yes and No"
+        )
+    yes_probability = _finite_number(
+        probabilities["Yes"], f"{prefix} Yes probability", minimum=0.0, maximum=1.0
+    )
+    no_probability = _finite_number(
+        probabilities["No"], f"{prefix} No probability", minimum=0.0, maximum=1.0
+    )
+    if not math.isclose(
+        yes_probability + no_probability, 1.0, rel_tol=0.0, abs_tol=1e-9
+    ):
+        raise CheckpointValidationError(f"{prefix} probabilities must sum to one")
+
+    label_logprobs = value["label_logprobs"]
+    if not isinstance(label_logprobs, Mapping) or set(label_logprobs) != {
+        "Yes",
+        "No",
+    }:
+        raise CheckpointValidationError(
+            f"{prefix} label_logprobs must contain exactly Yes and No"
+        )
+    yes_logprob = _finite_number(label_logprobs["Yes"], f"{prefix} Yes logprob")
+    no_logprob = _finite_number(label_logprobs["No"], f"{prefix} No logprob")
+
+    candidate_mass = _finite_number(
+        value["candidate_mass"], f"{prefix} candidate_mass", minimum=0.0, maximum=1.0
+    )
+    residual_mass = _finite_number(
+        value["residual_mass"], f"{prefix} residual_mass", minimum=0.0, maximum=1.0
+    )
+    if not math.isclose(candidate_mass + residual_mass, 1.0, rel_tol=0.0, abs_tol=1e-9):
+        raise CheckpointValidationError(
+            f"{prefix} candidate_mass and residual_mass must sum to one"
+        )
+
+    candidates = value["candidates"]
+    if not isinstance(candidates, list) or not 2 <= len(candidates) <= 128:
+        raise CheckpointValidationError(
+            f"{prefix} candidates must be a list containing 2 to 128 entries"
+        )
+    candidate_by_id: Dict[int, str] = {}
+    candidate_logprobs: Dict[str, List[float]] = {"Yes": [], "No": []}
+    candidate_probabilities: List[float] = []
+    for index, candidate in enumerate(candidates):
+        candidate_prefix = f"{prefix} candidate {index}"
+        if not isinstance(candidate, Mapping):
+            raise CheckpointValidationError(f"{candidate_prefix} must be an object")
+        required = {"token_id", "choice", "decoded_token", "logprob", "probability"}
+        missing_candidate = required.difference(candidate)
+        if missing_candidate:
+            raise CheckpointValidationError(
+                f"{candidate_prefix} is missing field: {sorted(missing_candidate)[0]}"
+            )
+        token_id = candidate["token_id"]
+        if isinstance(token_id, bool) or not isinstance(token_id, int) or token_id < 0:
+            raise CheckpointValidationError(
+                f"{candidate_prefix} token_id must be a non-negative integer"
+            )
+        if token_id in candidate_by_id:
+            raise CheckpointValidationError(
+                f"{prefix} candidate token IDs must be unique"
+            )
+        choice = candidate["choice"]
+        if choice not in {"Yes", "No"}:
+            raise CheckpointValidationError(
+                f"{candidate_prefix} choice must be Yes or No"
+            )
+        decoded_token = candidate["decoded_token"]
+        if decoded_token is not None and not isinstance(decoded_token, str):
+            raise CheckpointValidationError(
+                f"{candidate_prefix} decoded_token must be a string or null"
+            )
+        logprob = _finite_number(candidate["logprob"], f"{candidate_prefix} logprob")
+        if logprob > 1e-9:
+            raise CheckpointValidationError(
+                f"{candidate_prefix} logprob cannot be positive"
+            )
+        probability = _finite_number(
+            candidate["probability"],
+            f"{candidate_prefix} probability",
+            minimum=0.0,
+            maximum=1.0,
+        )
+        if not math.isclose(
+            probability, math.exp(logprob), rel_tol=1e-9, abs_tol=1e-12
+        ):
+            raise CheckpointValidationError(
+                f"{candidate_prefix} probability does not match logprob"
+            )
+        candidate_by_id[token_id] = choice
+        candidate_logprobs[choice].append(logprob)
+        candidate_probabilities.append(probability)
+
+    if any(not values for values in candidate_logprobs.values()):
+        raise CheckpointValidationError(f"{prefix} candidates must cover Yes and No")
+    for choice, stored in (("Yes", yes_logprob), ("No", no_logprob)):
+        calculated = _logsumexp(candidate_logprobs[choice])
+        if not math.isclose(calculated, stored, rel_tol=1e-9, abs_tol=1e-9):
+            raise CheckpointValidationError(
+                f"{prefix} {choice} label_logprob does not match candidates"
+            )
+    if not math.isclose(
+        math.fsum(candidate_probabilities),
+        candidate_mass,
+        rel_tol=1e-9,
+        abs_tol=1e-12,
+    ):
+        raise CheckpointValidationError(
+            f"{prefix} candidate_mass does not match candidates"
+        )
+
+    total_logprob = _logsumexp((yes_logprob, no_logprob))
+    expected_yes = math.exp(yes_logprob - total_logprob)
+    if not math.isclose(
+        yes_probability, expected_yes, rel_tol=1e-9, abs_tol=1e-12
+    ) or not math.isclose(
+        no_probability, 1.0 - expected_yes, rel_tol=1e-9, abs_tol=1e-12
+    ):
+        raise CheckpointValidationError(
+            f"{prefix} conditional probabilities do not match label_logprobs"
+        )
+
+    sampled_token_id = value["sampled_token_id"]
+    if (
+        isinstance(sampled_token_id, bool)
+        or not isinstance(sampled_token_id, int)
+        or sampled_token_id not in candidate_by_id
+    ):
+        raise CheckpointValidationError(
+            f"{prefix} sampled_token_id must identify a candidate token"
+        )
+    sampled_choice = value["sampled_choice"]
+    if sampled_choice not in {"Yes", "No"}:
+        raise CheckpointValidationError(f"{prefix} sampled_choice must be Yes or No")
+    if candidate_by_id[sampled_token_id] != sampled_choice:
+        raise CheckpointValidationError(
+            f"{prefix} sampled_choice does not match sampled_token_id"
+        )
+    if value["format_valid"] is not True:
+        raise CheckpointValidationError(
+            f"{prefix} format_valid must be true for a VALID record"
+        )
+
+    analysis_text = value["analysis_text"]
+    if not isinstance(analysis_text, str) or not analysis_text.strip():
+        raise CheckpointValidationError(f"{prefix} analysis_text must be non-empty")
+    if value["analysis_text_kind"] != "model_generated_visible_text":
+        raise CheckpointValidationError(f"{prefix} has an invalid analysis_text_kind")
+    if value["estimator"] != "bounded_single_token_candidate_set":
+        raise CheckpointValidationError(f"{prefix} has an invalid estimator")
+    if value["conditional_on_candidate_set"] is not True:
+        raise CheckpointValidationError(
+            f"{prefix} conditional_on_candidate_set must be true"
+        )
+    scoring_temperature = _finite_number(
+        value["scoring_temperature"], f"{prefix} scoring_temperature"
+    )
+    if scoring_temperature != 0.0:
+        raise CheckpointValidationError(f"{prefix} scoring_temperature must be zero")
+    finish_reason = value["finish_reason"]
+    if finish_reason is not None and not isinstance(finish_reason, str):
+        raise CheckpointValidationError(
+            f"{prefix} finish_reason must be a string or null"
+        )
+
+
+def _validate_checkpoint_record(
+    manifest: "RunManifest", record: ExperimentRecord
+) -> None:
+    if manifest.pipeline not in _SUPPORTED_PIPELINES:
+        raise CheckpointValidationError(
+            f"unsupported checkpoint pipeline: {manifest.pipeline!r}"
+        )
+    if not isinstance(record.status, ResultStatus):
+        raise CheckpointValidationError(
+            f"record {record.sample_id} status must be a ResultStatus"
+        )
+    if record.raw_response is not None and not isinstance(record.raw_response, str):
+        raise CheckpointValidationError(
+            f"record {record.sample_id} raw_response must be a string or null"
+        )
+    if record.status is ResultStatus.VALID:
+        if record.error_code is not None or record.error_message is not None:
+            raise CheckpointValidationError(
+                f"VALID record {record.sample_id} cannot contain error fields"
+            )
+        if record.stage == "step2":
+            _validate_percentage_value(
+                record.value, field=f"record {record.sample_id} Step 2 value"
+            )
+        elif record.stage in _BINARY_STAGES:
+            if manifest.pipeline == "verbalize":
+                if not isinstance(record.value, str) or record.value not in {
+                    "Yes",
+                    "No",
+                }:
+                    raise CheckpointValidationError(
+                        f"VALID verbalize record {record.sample_id} must be Yes or No"
+                    )
+            else:
+                validate_logprob_value(record.value, sample_id=record.sample_id)
+        return
+
+    if not isinstance(record.error_code, str) or not record.error_code:
+        raise CheckpointValidationError(
+            f"{record.status.value.upper()} record {record.sample_id} requires error_code"
+        )
+    if not isinstance(record.error_message, str):
+        raise CheckpointValidationError(
+            f"{record.status.value.upper()} record {record.sample_id} requires error_message"
+        )
+    if (
+        record.status is ResultStatus.INVALID
+        and record.stage == "step2"
+        and record.value is not None
+    ):
+        raise CheckpointValidationError(
+            f"INVALID Step 2 record {record.sample_id} must have a null value"
+        )
+    if manifest.pipeline == "verbalize" and record.status is ResultStatus.INVALID:
+        if record.value is not None:
+            raise CheckpointValidationError(
+                f"INVALID verbalize record {record.sample_id} must have a null value"
+            )
+    if (
+        manifest.pipeline == "logprob"
+        and record.status is ResultStatus.INVALID
+        and record.stage in _BINARY_STAGES
+        and record.value is not None
+    ):
+        if not isinstance(record.value, Mapping):
+            raise CheckpointValidationError(
+                f"INVALID logprob record {record.sample_id} diagnostics must be an object"
+            )
+        if "format_valid" in record.value:
+            format_valid = record.value["format_valid"]
+            sampled_choice = record.value.get("sampled_choice")
+            if format_valid is not None and not isinstance(format_valid, bool):
+                raise CheckpointValidationError(
+                    f"INVALID logprob record {record.sample_id} format_valid must be "
+                    "boolean or null"
+                )
+            if sampled_choice not in {None, "Yes", "No"}:
+                raise CheckpointValidationError(
+                    f"INVALID logprob record {record.sample_id} has invalid sampled_choice"
+                )
+            if (
+                format_valid is None
+                and sampled_choice is not None
+                or format_valid is not None
+                and format_valid != (sampled_choice in {"Yes", "No"})
+            ):
+                raise CheckpointValidationError(
+                    f"INVALID logprob record {record.sample_id} has inconsistent format fields"
+                )
+
+
+def _records_sha256(records: Sequence[Mapping[str, Any]]) -> str:
+    try:
+        serialized = canonical_json(records)
+    except ValueError as exc:
+        raise CheckpointValidationError(
+            f"checkpoint records are not finite canonical JSON: {exc}"
+        ) from exc
+    return sha256_text(serialized)
+
+
+def _reject_nonfinite_json_numbers(value: Any, path: str = "$") -> None:
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"non-finite JSON number at {path}")
+    if isinstance(value, Mapping):
+        for key, nested in value.items():
+            _reject_nonfinite_json_numbers(nested, f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, nested in enumerate(value):
+            _reject_nonfinite_json_numbers(nested, f"{path}[{index}]")
 
 
 def _validate_stage(stage: str) -> None:
@@ -168,7 +538,8 @@ class RunManifest:
         if not isinstance(self.pipeline, str) or not self.pipeline:
             raise ValueError("pipeline must be a non-empty string")
         if (
-            isinstance(self.schema_version, bool)
+            not isinstance(self.schema_version, int)
+            or isinstance(self.schema_version, bool)
             or self.schema_version != SCHEMA_VERSION
         ):
             raise CheckpointValidationError(
@@ -450,6 +821,7 @@ def _load_json_object(path: Path) -> Mapping[str, Any]:
             object_pairs_hook=unique_object_pairs,
             parse_constant=reject_json_constant,
         )
+        _reject_nonfinite_json_numbers(parsed)
     except DuplicateJsonKey as exc:
         raise CheckpointValidationError(
             f"cannot load checkpoint {path}: duplicate_json_key: {exc}"
@@ -519,6 +891,9 @@ class CheckpointStore:
 
     def __init__(self, root: Union[str, Path]):
         self.root = Path(root)
+        self._stage_authority_cache: Dict[
+            Tuple[str, str, str], _StageAuthorityCache
+        ] = {}
 
     def run_directory(self, run_id: str) -> Path:
         _validate_run_id(run_id)
@@ -606,6 +981,49 @@ class CheckpointStore:
         return self.stage_directory(manifest, stage) / ".sample-index.sqlite3"
 
     @staticmethod
+    def _file_signature(path: Path) -> _FileSignature:
+        stat_result = path.lstat()
+        return (
+            stat_result.st_dev,
+            stat_result.st_ino,
+            stat_result.st_mode,
+            stat_result.st_size,
+            stat_result.st_mtime_ns,
+            stat_result.st_ctime_ns,
+        )
+
+    def _stage_cache_key(
+        self, manifest: RunManifest, stage: str
+    ) -> Tuple[str, str, str]:
+        return (
+            str(self.stage_directory(manifest, stage).resolve()),
+            manifest.run_fingerprint,
+            stage,
+        )
+
+    def _cached_stage_is_unchanged(
+        self,
+        cache: _StageAuthorityCache,
+        chunk_paths: Sequence[Path],
+        index_path: Path,
+    ) -> bool:
+        """Return whether files still match this store's last validated view."""
+
+        if not index_path.exists() or index_path.is_symlink():
+            return False
+        if {path.name for path in chunk_paths} != set(cache.chunk_signatures):
+            return False
+        try:
+            if self._file_signature(index_path) != cache.index_signature:
+                return False
+            return all(
+                self._file_signature(path) == cache.chunk_signatures[path.name]
+                for path in chunk_paths
+            )
+        except OSError:
+            return False
+
+    @staticmethod
     def _create_index_schema(connection: sqlite3.Connection) -> None:
         connection.executescript(
             """
@@ -621,15 +1039,66 @@ class CheckpointStore:
                 sample_id TEXT PRIMARY KEY,
                 chunk_name TEXT NOT NULL
             );
+            CREATE TRIGGER IF NOT EXISTS chunks_generation_insert
+            AFTER INSERT ON chunks BEGIN
+                UPDATE metadata
+                SET value = CAST(value AS INTEGER) + 1
+                WHERE key = 'content_generation';
+            END;
+            CREATE TRIGGER IF NOT EXISTS chunks_generation_update
+            AFTER UPDATE ON chunks BEGIN
+                UPDATE metadata
+                SET value = CAST(value AS INTEGER) + 1
+                WHERE key = 'content_generation';
+            END;
+            CREATE TRIGGER IF NOT EXISTS chunks_generation_delete
+            AFTER DELETE ON chunks BEGIN
+                UPDATE metadata
+                SET value = CAST(value AS INTEGER) + 1
+                WHERE key = 'content_generation';
+            END;
+            CREATE TRIGGER IF NOT EXISTS samples_generation_insert
+            AFTER INSERT ON samples BEGIN
+                UPDATE metadata
+                SET value = CAST(value AS INTEGER) + 1
+                WHERE key = 'content_generation';
+            END;
+            CREATE TRIGGER IF NOT EXISTS samples_generation_update
+            AFTER UPDATE ON samples BEGIN
+                UPDATE metadata
+                SET value = CAST(value AS INTEGER) + 1
+                WHERE key = 'content_generation';
+            END;
+            CREATE TRIGGER IF NOT EXISTS samples_generation_delete
+            AFTER DELETE ON samples BEGIN
+                UPDATE metadata
+                SET value = CAST(value AS INTEGER) + 1
+                WHERE key = 'content_generation';
+            END;
             """
         )
+
+    @staticmethod
+    def _expected_index_metadata(
+        manifest: RunManifest,
+        stage: str,
+        *,
+        chunk_count: int,
+        sample_count: int,
+    ) -> Dict[str, str]:
+        return {
+            "index_schema_version": _INDEX_SCHEMA_VERSION,
+            "run_fingerprint": manifest.run_fingerprint,
+            "stage": stage,
+            "content_generation": str(chunk_count + sample_count),
+        }
 
     def _rebuild_stage_index(
         self,
         manifest: RunManifest,
         stage: str,
         index_path: Path,
-        chunk_paths: Sequence[Path],
+        chunk_sample_ids: Sequence[Tuple[Path, Sequence[str]]],
     ) -> None:
         """Atomically rebuild the disposable ID index from immutable JSON shards."""
 
@@ -649,17 +1118,17 @@ class CheckpointStore:
                     ("index_schema_version", _INDEX_SCHEMA_VERSION),
                     ("run_fingerprint", manifest.run_fingerprint),
                     ("stage", stage),
+                    ("content_generation", "0"),
                 ),
             )
-            for chunk_path in chunk_paths:
-                records = self._load_chunk(manifest, stage, chunk_path)
+            for chunk_path, sample_ids in chunk_sample_ids:
                 connection.execute(
                     "INSERT INTO chunks(chunk_name, sample_count) VALUES (?, ?)",
-                    (chunk_path.name, len(records)),
+                    (chunk_path.name, len(sample_ids)),
                 )
                 connection.executemany(
                     "INSERT INTO samples(sample_id, chunk_name) VALUES (?, ?)",
-                    ((record.sample_id, chunk_path.name) for record in records),
+                    ((sample_id, chunk_path.name) for sample_id in sample_ids),
                 )
             connection.commit()
             connection.close()
@@ -679,8 +1148,8 @@ class CheckpointStore:
         self,
         manifest: RunManifest,
         stage: str,
-    ) -> sqlite3.Connection:
-        """Open a rebuildable index synchronized with current immutable shards."""
+    ) -> Tuple[sqlite3.Connection, frozenset[str]]:
+        """Open an index verified against the authoritative immutable shards."""
 
         stage_dir = self.stage_directory(manifest, stage)
         stage_dir.mkdir(parents=True, exist_ok=True)
@@ -690,7 +1159,49 @@ class CheckpointStore:
                 f"checkpoint sample index must not be a symbolic link: {index_path}"
             )
         chunk_paths = tuple(sorted(stage_dir.glob("chunk_*.json")))
-        chunk_names = {path.name for path in chunk_paths}
+        cache_key = self._stage_cache_key(manifest, stage)
+        cached = self._stage_authority_cache.get(cache_key)
+        if cached is not None and self._cached_stage_is_unchanged(
+            cached, chunk_paths, index_path
+        ):
+            connection: sqlite3.Connection | None = None
+            try:
+                connection = sqlite3.connect(index_path)
+                metadata = dict(connection.execute("SELECT key, value FROM metadata"))
+                if metadata == self._expected_index_metadata(
+                    manifest,
+                    stage,
+                    chunk_count=len(cached.chunk_sample_ids),
+                    sample_count=len(cached.sample_chunks),
+                ):
+                    return connection, frozenset(cached.sample_chunks)
+                connection.close()
+            except sqlite3.DatabaseError:
+                if connection is not None:
+                    try:
+                        connection.close()
+                    except sqlite3.DatabaseError:
+                        pass
+            # A signature match is only an optimization hint. If even the
+            # compact metadata check disagrees, discard it and re-establish the
+            # view from the authoritative JSON files below.
+            self._stage_authority_cache.pop(cache_key, None)
+
+        chunk_sample_ids: List[Tuple[Path, Sequence[str]]] = []
+        authoritative_chunks: Dict[str, int] = {}
+        authoritative_samples: Dict[str, str] = {}
+        for chunk_path in chunk_paths:
+            records = self._load_chunk(manifest, stage, chunk_path)
+            sample_ids = tuple(record.sample_id for record in records)
+            chunk_sample_ids.append((chunk_path, sample_ids))
+            authoritative_chunks[chunk_path.name] = len(sample_ids)
+            for record in records:
+                if record.sample_id in authoritative_samples:
+                    raise CheckpointValidationError(
+                        f"duplicate sample ID across checkpoint chunks in {stage}: "
+                        f"{record.sample_id}"
+                    )
+                authoritative_samples[record.sample_id] = chunk_path.name
 
         rebuild = not index_path.exists()
         connection: sqlite3.Connection | None = None
@@ -702,19 +1213,20 @@ class CheckpointStore:
                 indexed_chunks = dict(
                     connection.execute("SELECT chunk_name, sample_count FROM chunks")
                 )
-                indexed_sample_count = connection.execute(
-                    "SELECT COUNT(*) FROM samples"
-                ).fetchone()[0]
+                indexed_samples = dict(
+                    connection.execute("SELECT sample_id, chunk_name FROM samples")
+                )
                 quick_check = connection.execute("PRAGMA quick_check").fetchone()
                 rebuild = (
                     metadata
-                    != {
-                        "index_schema_version": _INDEX_SCHEMA_VERSION,
-                        "run_fingerprint": manifest.run_fingerprint,
-                        "stage": stage,
-                    }
-                    or set(indexed_chunks) != chunk_names
-                    or sum(indexed_chunks.values()) != indexed_sample_count
+                    != self._expected_index_metadata(
+                        manifest,
+                        stage,
+                        chunk_count=len(authoritative_chunks),
+                        sample_count=len(authoritative_samples),
+                    )
+                    or indexed_chunks != authoritative_chunks
+                    or indexed_samples != authoritative_samples
                     or quick_check != ("ok",)
                 )
             except (sqlite3.DatabaseError, TypeError, ValueError):
@@ -729,11 +1241,42 @@ class CheckpointStore:
                 manifest,
                 stage,
                 index_path,
-                chunk_paths,
+                chunk_sample_ids,
             )
             connection = sqlite3.connect(index_path)
         assert connection is not None
-        return connection
+        self._stage_authority_cache[cache_key] = _StageAuthorityCache(
+            chunk_signatures={
+                chunk_path.name: self._file_signature(chunk_path)
+                for chunk_path in chunk_paths
+            },
+            chunk_sample_ids={
+                chunk_path.name: tuple(sample_ids)
+                for chunk_path, sample_ids in chunk_sample_ids
+            },
+            sample_chunks=dict(authoritative_samples),
+            index_signature=self._file_signature(index_path),
+        )
+        return connection, frozenset(authoritative_samples)
+
+    def _cache_appended_chunk(
+        self,
+        manifest: RunManifest,
+        stage: str,
+        target: Path,
+        sample_ids: Sequence[str],
+    ) -> None:
+        """Advance a warm authority cache after JSON and SQLite both commit."""
+
+        cache = self._stage_authority_cache.get(self._stage_cache_key(manifest, stage))
+        if cache is None:
+            return
+        cache.chunk_signatures[target.name] = self._file_signature(target)
+        cache.chunk_sample_ids[target.name] = tuple(sample_ids)
+        cache.sample_chunks.update((sample_id, target.name) for sample_id in sample_ids)
+        cache.index_signature = self._file_signature(
+            self._stage_index_path(manifest, stage)
+        )
 
     def write_chunk(
         self,
@@ -752,6 +1295,7 @@ class CheckpointStore:
                 raise CheckpointValidationError(
                     f"record {record.sample_id} has stage {record.stage!r}, expected {stage!r}"
                 )
+            _validate_checkpoint_record(manifest, record)
 
         expected = manifest.expected_sample_ids[stage]
         validate_record_ids(
@@ -761,6 +1305,7 @@ class CheckpointStore:
         )
 
         target = self._chunk_path(manifest, stage, chunk_index)
+        records_payload = [record.to_dict() for record in normalized]
         payload = {
             "schema_version": SCHEMA_VERSION,
             "run_id": manifest.run_id,
@@ -768,7 +1313,8 @@ class CheckpointStore:
             "stage": stage,
             "chunk_index": chunk_index,
             "written_at": datetime.now(timezone.utc).isoformat(),
-            "records": [record.to_dict() for record in normalized],
+            "records_sha256": _records_sha256(records_payload),
+            "records": records_payload,
         }
 
         with _exclusive_file_lock(self._run_lock_path(manifest.run_id)):
@@ -777,7 +1323,9 @@ class CheckpointStore:
                 raise CheckpointValidationError(
                     "provided manifest does not match the manifest stored on disk"
                 )
-            index = self._open_synchronized_stage_index(manifest, stage)
+            index, authoritative_sample_ids = self._open_synchronized_stage_index(
+                manifest, stage
+            )
             try:
                 if target.exists():
                     existing_records = self._load_chunk(manifest, stage, target)
@@ -790,21 +1338,13 @@ class CheckpointStore:
                     )
 
                 sample_ids = [record.sample_id for record in normalized]
-                duplicate_row = None
-                for start in range(0, len(sample_ids), _SQLITE_QUERY_BATCH_SIZE):
-                    batch = sample_ids[start : start + _SQLITE_QUERY_BATCH_SIZE]
-                    placeholders = ",".join("?" for _ in batch)
-                    duplicate_row = index.execute(
-                        f"SELECT sample_id FROM samples WHERE sample_id IN ({placeholders}) "
-                        "ORDER BY sample_id LIMIT 1",
-                        batch,
-                    ).fetchone()
-                    if duplicate_row is not None:
-                        break
-                if duplicate_row is not None:
+                duplicate_ids = sorted(
+                    set(sample_ids).intersection(authoritative_sample_ids)
+                )
+                if duplicate_ids:
                     raise CheckpointValidationError(
                         "sample ID already exists in another checkpoint chunk: "
-                        f"{duplicate_row[0]}"
+                        f"{duplicate_ids[0]}"
                     )
 
                 atomic_write_json(target, payload)
@@ -819,6 +1359,12 @@ class CheckpointStore:
                     )
             finally:
                 index.close()
+            self._cache_appended_chunk(
+                manifest,
+                stage,
+                target,
+                sample_ids,
+            )
         return target
 
     def _load_chunk(
@@ -833,7 +1379,12 @@ class CheckpointStore:
                 f"checkpoint chunk must be a regular file within its stage: {path}"
             )
         payload = _load_json_object(path)
-        if payload.get("schema_version") != SCHEMA_VERSION:
+        schema_version = payload.get("schema_version")
+        if (
+            not isinstance(schema_version, int)
+            or isinstance(schema_version, bool)
+            or schema_version != SCHEMA_VERSION
+        ):
             raise CheckpointValidationError(f"unsupported checkpoint schema in {path}")
         if payload.get("run_id") != manifest.run_id:
             raise CheckpointValidationError(f"checkpoint run_id mismatch in {path}")
@@ -860,6 +1411,18 @@ class CheckpointStore:
             raise CheckpointValidationError(
                 f"checkpoint records must be a list in {path}"
             )
+        stored_records_sha256 = payload.get("records_sha256")
+        if not isinstance(stored_records_sha256, str) or not _SHA256_RE.fullmatch(
+            stored_records_sha256
+        ):
+            raise CheckpointValidationError(
+                f"checkpoint records_sha256 is missing or invalid in {path}"
+            )
+        actual_records_sha256 = _records_sha256(records_payload)
+        if stored_records_sha256 != actual_records_sha256:
+            raise CheckpointValidationError(
+                f"checkpoint records digest mismatch in {path}"
+            )
         try:
             records = _coerce_records(records_payload)
         except (TypeError, ValueError) as exc:
@@ -871,6 +1434,7 @@ class CheckpointStore:
                 raise CheckpointValidationError(
                     f"record {record.sample_id} has wrong stage in {path}"
                 )
+            _validate_checkpoint_record(manifest, record)
         return records
 
     def load_stage(

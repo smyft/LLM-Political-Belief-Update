@@ -8,7 +8,7 @@ import pytest
 
 import src.models.unified_llm_interface as unified_module
 import src.models.vllm_interface as vllm_module
-from src.models.unified_llm_interface import APIInterface
+from src.models.unified_llm_interface import APIInterface, UnifiedLLMInterface
 from src.models.vllm_interface import VLLMInterface
 
 
@@ -483,6 +483,7 @@ def test_continuation_requests_only_candidate_ids_and_first_token(monkeypatch):
     assert sampling_kwargs["max_tokens"] == 1
     assert sampling_kwargs["logprob_token_ids"] == [11, 22]
     assert "logprobs" not in sampling_kwargs
+    assert "prompt_logprobs" not in sampling_kwargs
     assert call["use_tqdm"] is False
     assert call["add_generation_prompt"] is False
     assert call["continue_final_message"] is True
@@ -493,6 +494,100 @@ def test_continuation_requests_only_candidate_ids_and_first_token(monkeypatch):
     assert results[0]["residual_mass"] == pytest.approx(0.2)
     assert results[0]["probabilities"]["Yes"] == pytest.approx(0.75)
     assert results[0]["logprobs_raw"] == results[0]["label_logprobs"]
+
+
+def test_continuation_preflight_loads_once_caches_and_never_infers(monkeypatch):
+    monkeypatch.setattr(vllm_module, "VLLM_AVAILABLE", True)
+    events = {"loads": 0, "tokenizers": 0, "chat": 0, "generate": 0}
+    sampling_calls = []
+
+    class RecordingSamplingParams:
+        def __init__(self, **kwargs):
+            sampling_calls.append(kwargs)
+
+    class PreflightLLM:
+        def __init__(self, **kwargs):
+            del kwargs
+            events["loads"] += 1
+
+        def get_tokenizer(self):
+            events["tokenizers"] += 1
+            return FakeTokenizer()
+
+        def chat(
+            self,
+            messages,
+            sampling_params=None,
+            use_tqdm=True,
+            add_generation_prompt=True,
+            continue_final_message=False,
+        ):
+            del (
+                messages,
+                sampling_params,
+                use_tqdm,
+                add_generation_prompt,
+                continue_final_message,
+            )
+            events["chat"] += 1
+            raise AssertionError("preflight must not call chat")
+
+        def generate(self, *args, **kwargs):
+            del args, kwargs
+            events["generate"] += 1
+            raise AssertionError("preflight must not call generate")
+
+    monkeypatch.setattr(vllm_module, "LLM", PreflightLLM, raising=False)
+    monkeypatch.setattr(
+        vllm_module, "SamplingParams", RecordingSamplingParams, raising=False
+    )
+    interface = VLLMInterface("fake/model")
+
+    first = interface.preflight_continuation_scoring()
+    first[11] = "No"
+    first[999] = "Yes"
+    second = interface.preflight_continuation_scoring()
+    interface.load_model()
+
+    assert second == {11: "Yes", 22: "No"}
+    assert events == {"loads": 1, "tokenizers": 1, "chat": 0, "generate": 0}
+    assert sampling_calls == [
+        {
+            "max_tokens": 1,
+            "logprob_token_ids": [11, 22],
+            "skip_special_tokens": False,
+        }
+    ]
+
+
+def test_continuation_preflight_rejects_incompatible_sampling_params(monkeypatch):
+    interface = make_vllm_interface(monkeypatch)
+    interface.llm = CompatibleFakeLLM([])
+
+    class OldSamplingParams:
+        def __init__(self, max_tokens, skip_special_tokens):
+            del max_tokens, skip_special_tokens
+
+    monkeypatch.setattr(vllm_module, "SamplingParams", OldSamplingParams)
+
+    with pytest.raises(RuntimeError, match="logprob_token_ids"):
+        interface.preflight_continuation_scoring()
+    assert interface.llm.calls == []
+
+
+def test_unified_continuation_preflight_forwards_locally_and_rejects_api():
+    local = object.__new__(UnifiedLLMInterface)
+    local.use_api = False
+    local.interface = SimpleNamespace(
+        preflight_continuation_scoring=lambda: {11: "Yes", 22: "No"}
+    )
+    assert local.preflight_continuation_scoring() == {11: "Yes", 22: "No"}
+
+    api = object.__new__(UnifiedLLMInterface)
+    api.use_api = True
+    api.interface = object()
+    with pytest.raises(NotImplementedError, match="only available with the vLLM"):
+        api.preflight_continuation_scoring()
 
 
 def test_continuation_missing_candidate_is_explicitly_invalid(monkeypatch):

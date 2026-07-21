@@ -1,3 +1,4 @@
+import hashlib
 import json
 from pathlib import Path
 
@@ -61,6 +62,75 @@ def test_loader_validates_and_indexes_data(valid_data_dir: Path) -> None:
         ("Public Advocacy", "Action 2"),
         ("Strategic Support", "Action 3"),
     ]
+
+
+def test_validated_snapshots_are_defensive_copies(valid_data_dir: Path) -> None:
+    loader = DataLoader(str(valid_data_dir))
+
+    entities = loader.load_entities()
+    entities["politicians"].append("injected")
+    assert loader.load_entities()["politicians"] == ["Person A"]
+    public_entities = loader.entities
+    assert public_entities is not None
+    public_entities["platforms"].clear()
+    assert loader.get_personas() == ["none", "Person A", "Platform B"]
+
+    proposals = loader.load_proposals()
+    proposals["economy"][0]["political_proposal"] = "injected"
+    assert loader.get_unique_proposals() == [("economy", "Proposal 1")]
+    public_proposals = loader.proposals
+    assert public_proposals is not None
+    public_proposals.clear()
+    assert loader.get_categories() == ["economy"]
+
+
+def test_failed_validation_does_not_poison_entity_cache(valid_data_dir: Path) -> None:
+    entities_path = valid_data_dir / "entities.json"
+    valid_entities = json.loads(entities_path.read_text(encoding="utf-8"))
+    _write_json(
+        entities_path,
+        {"politicians": "not-a-list", "platforms": []},
+    )
+    loader = DataLoader(str(valid_data_dir))
+
+    with pytest.raises(ValueError, match="politicians must be a list"):
+        loader.load_entities()
+
+    _write_json(entities_path, valid_entities)
+    assert loader.get_personas() == ["none", "Person A", "Platform B"]
+
+
+def test_failed_validation_does_not_poison_proposal_cache(valid_data_dir: Path) -> None:
+    proposals_path = valid_data_dir / "proposal_actions.json"
+    valid_proposals = json.loads(proposals_path.read_text(encoding="utf-8"))
+    _write_json(proposals_path, {"economy": []})
+    loader = DataLoader(str(valid_data_dir))
+
+    with pytest.raises(ValueError, match="must be non-empty"):
+        loader.load_proposals()
+
+    _write_json(proposals_path, valid_proposals)
+    assert loader.get_unique_proposals() == [("economy", "Proposal 1")]
+
+
+def test_snapshot_hashes_describe_loaded_bytes_and_detect_drift(
+    valid_data_dir: Path,
+) -> None:
+    loader = DataLoader(str(valid_data_dir))
+    loader.get_proposal_action_pairs()
+    hashes = loader.snapshot_hashes()
+    proposal_path = valid_data_dir / "proposal_actions.json"
+
+    assert (
+        hashes["proposal_actions.json"]
+        == hashlib.sha256(proposal_path.read_bytes()).hexdigest()
+    )
+
+    proposals = json.loads(proposal_path.read_text(encoding="utf-8"))
+    proposals["economy"][0]["actions"][0]["action_description"] = "Changed action"
+    _write_json(proposal_path, proposals)
+    with pytest.raises(ValueError, match="changed after its validated data snapshot"):
+        loader.snapshot_hashes()
 
 
 @pytest.mark.parametrize(

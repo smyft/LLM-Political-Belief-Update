@@ -17,20 +17,34 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 from src.data.data_loader import instantiate_prompt
-from src.experiment.base_runner import Assignment, BaseExperimentRunner, print_json
+from src.experiment.base_runner import (
+    Assignment,
+    BaseExperimentRunner,
+    default_results_directory,
+    print_json,
+)
+from src.experiment.checkpoints import (
+    CheckpointValidationError,
+    validate_logprob_value,
+)
 from src.experiment.core import (
     ExperimentRecord,
     ResultStatus,
+    canonical_json,
     make_record,
     parse_percentage_response,
 )
-from src.experiment.planning import TreatmentAssignment
+from src.experiment.planning import (
+    TreatmentAssignment,
+    format_presented_percentage,
+)
 
 
 _BINARY_STAGES = frozenset({"step1", "step3", "step4a", "step4b"})
@@ -51,6 +65,37 @@ _SCORE_FIELDS = (
     "sampled_token_id",
     "sampled_choice",
     "format_valid",
+)
+_MARKED_BINARY_ANSWER = r"(?:\*\*|__|[`\"'])?(?:yes|no)(?:\*\*|__|[`\"'])?"
+_STANDALONE_FINAL_ANSWER_RE = re.compile(
+    rf"^\s*{_MARKED_BINARY_ANSWER}\s*[.!?]?\s*$",
+    re.IGNORECASE,
+)
+_TERMINAL_ANSWER_LINE_RE = re.compile(
+    rf"(?:^|[\r\n])\s*{_MARKED_BINARY_ANSWER}\s*[.!?]?\s*$",
+    re.IGNORECASE,
+)
+_POST_THINK_FINAL_ANSWER_RE = re.compile(
+    rf"</think>\s*{_MARKED_BINARY_ANSWER}\s*[.!?]?\s*$",
+    re.IGNORECASE,
+)
+_LEADING_BECAUSE_ANSWER_RE = re.compile(
+    rf"^\s*{_MARKED_BINARY_ANSWER}(?:\s*[,;:\-\u2013\u2014])?\s+because\b",
+    re.IGNORECASE,
+)
+_LABELED_FINAL_ANSWER_RE = re.compile(
+    rf"\b(?:final\s+answer|answer)\s*(?::|is)\s*"
+    rf"{_MARKED_BINARY_ANSWER}\s*[.!?]?\s*$",
+    re.IGNORECASE,
+)
+_CONCLUSION_FINAL_ANSWER_RE = re.compile(
+    rf"\b(?:therefore|thus|hence|so)\s*[,;:\-]?\s*"
+    rf"(?:the\s+answer\s+is\s+)?{_MARKED_BINARY_ANSWER}\s*[.!?]?\s*$",
+    re.IGNORECASE,
+)
+_JSON_FENCE_RE = re.compile(
+    r"^\s*```(?:json)?\s*(.*?)\s*```\s*$",
+    re.IGNORECASE | re.DOTALL,
 )
 
 
@@ -162,6 +207,30 @@ class LogprobExperimentRunner(BaseExperimentRunner):
         if llm_factory is not None:
             base_kwargs["llm_factory"] = llm_factory
         super().__init__(**base_kwargs)
+        self._continuation_scoring_preflight_backend: Any | None = None
+
+    def _preflight_continuation_scoring(self) -> Any:
+        """Initialize and validate continuation scoring once, before any chat call."""
+
+        backend = self.initialize_llm()
+        if self._continuation_scoring_preflight_backend is backend:
+            return backend
+        preflight = getattr(backend, "preflight_continuation_scoring", None)
+        if not callable(preflight):
+            raise RuntimeError(
+                "logprob backend does not provide preflight_continuation_scoring()"
+            )
+        preflight()
+        self._continuation_scoring_preflight_backend = backend
+        return backend
+
+    def cleanup(self) -> None:
+        """Release the backend and require a replacement backend to preflight."""
+
+        try:
+            super().cleanup()
+        finally:
+            self._continuation_scoring_preflight_backend = None
 
     def _extra_manifest_config(self) -> Mapping[str, Any]:
         return {
@@ -241,8 +310,36 @@ class LogprobExperimentRunner(BaseExperimentRunner):
         return text
 
     @staticmethod
-    def _format_percentage(value: float) -> str:
-        return f"{float(value):g}"
+    def _phase1_contains_final_answer(text: str) -> bool:
+        candidate = text.strip()
+        fenced = _JSON_FENCE_RE.fullmatch(candidate)
+        if fenced is not None:
+            candidate = fenced.group(1).strip()
+        try:
+            payload = json.loads(candidate)
+        except (json.JSONDecodeError, TypeError):
+            payload = None
+        if isinstance(payload, Mapping):
+            for key, value in payload.items():
+                if isinstance(key, str) and key.casefold() == "answer":
+                    if isinstance(value, bool):
+                        return True
+                    if isinstance(value, str) and value.strip().casefold() in {
+                        "yes",
+                        "no",
+                    }:
+                        return True
+        return any(
+            pattern.search(text) is not None
+            for pattern in (
+                _STANDALONE_FINAL_ANSWER_RE,
+                _TERMINAL_ANSWER_LINE_RE,
+                _POST_THINK_FINAL_ANSWER_RE,
+                _LEADING_BECAUSE_ANSWER_RE,
+                _LABELED_FINAL_ANSWER_RE,
+                _CONCLUSION_FINAL_ANSWER_RE,
+            )
+        )
 
     def _distribution_text(self, assignment: TreatmentAssignment) -> str:
         condition = assignment.condition
@@ -252,7 +349,7 @@ class LogprobExperimentRunner(BaseExperimentRunner):
                 raise ValueError("fixed survey treatment has no percentage")
             return (
                 "In this hypothetical experimental survey vignette, "
-                f"{self._format_percentage(percentage)}% of respondents answered Yes: "
+                f"{format_presented_percentage(percentage)}% of respondents answered Yes: "
                 "they said the policy would be beneficial to the United States. "
                 "This is an assigned hypothetical value, not a verified real-world poll."
             )
@@ -266,7 +363,7 @@ class LogprobExperimentRunner(BaseExperimentRunner):
             return (
                 f"Across {condition.consensus_n} other simulated persona conditions "
                 "(excluding the current persona), after averaging valid replicates "
-                f"within each persona, {self._format_percentage(percentage)}% answered "
+                f"within each persona, {format_presented_percentage(percentage)}% answered "
                 "Yes to the policy-benefit question. This statistic summarizes "
                 "simulated model outputs only."
             )
@@ -372,6 +469,44 @@ class LogprobExperimentRunner(BaseExperimentRunner):
         valid = response.get("valid")
         if valid is False:
             error = response.get("error")
+            sampled_token_id = response.get("sampled_token_id")
+            if sampled_token_id is not None and (
+                isinstance(sampled_token_id, bool)
+                or not isinstance(sampled_token_id, int)
+                or sampled_token_id < 0
+            ):
+                raise TypeError(
+                    "invalid continuation sampled_token_id must be a non-negative "
+                    "integer or null"
+                )
+            sampled_choice = response.get("sampled_choice")
+            if sampled_choice not in {None, "Yes", "No"}:
+                raise ValueError(
+                    "invalid continuation sampled_choice must be Yes, No, or null"
+                )
+            format_valid = response.get("format_valid")
+            if format_valid is not None and not isinstance(format_valid, bool):
+                raise TypeError(
+                    "invalid continuation format_valid must be a boolean or null"
+                )
+            if (
+                format_valid is None
+                and sampled_choice is not None
+                or format_valid is not None
+                and format_valid != (sampled_choice in {"Yes", "No"})
+            ):
+                raise ValueError(
+                    "invalid continuation format_valid must agree with sampled_choice"
+                )
+            candidates = response.get("candidates")
+            if candidates is not None and not isinstance(candidates, list):
+                raise TypeError(
+                    "invalid continuation candidates must be a list or null"
+                )
+            # Backend-declared INVALID diagnostics are still persisted. Ensure
+            # they cannot defer a non-finite/non-JSON failure to write_chunk(),
+            # where it would incorrectly abort the whole run.
+            canonical_json({field: response.get(field) for field in _SCORE_FIELDS})
             return False, (
                 error if isinstance(error, str) and error else "invalid_logprob_score"
             )
@@ -518,8 +653,8 @@ class LogprobExperimentRunner(BaseExperimentRunner):
                 )
 
         if executable:
+            backend = self._preflight_continuation_scoring()
             try:
-                backend = self.initialize_llm()
                 responses = backend.chat(
                     dialogue_history=[item[2] for item in executable],
                     temperature=self.temperature,
@@ -595,8 +730,8 @@ class LogprobExperimentRunner(BaseExperimentRunner):
         if not phase1_inputs:
             return [records[assignment.sample_id] for assignment in assignments]
 
+        backend = self._preflight_continuation_scoring()
         try:
-            backend = self.initialize_llm()
             phase1_responses = backend.chat(
                 dialogue_history=[item[3] for item in phase1_inputs],
                 temperature=self.temperature,
@@ -629,9 +764,21 @@ class LogprobExperimentRunner(BaseExperimentRunner):
         ):
             try:
                 analysis_text = self._response_text(response)
+                finish_reason = response.get("finish_reason")
+                if finish_reason is not None and not isinstance(finish_reason, str):
+                    raise TypeError("phase 1 finish_reason must be a string or null")
             except (TypeError, ValueError) as exc:
                 records[assignment.sample_id] = self._error_record(
                     assignment, metadata, "phase1_response_schema_error", str(exc)
+                )
+                continue
+            if finish_reason is not None and finish_reason.casefold() == "length":
+                records[assignment.sample_id] = self._invalid_record(
+                    assignment,
+                    metadata,
+                    "phase1_truncated",
+                    "phase 1 reached its token limit; continuation was not attempted",
+                    raw_response=analysis_text,
                 )
                 continue
             if not analysis_text.strip():
@@ -640,6 +787,15 @@ class LogprobExperimentRunner(BaseExperimentRunner):
                     metadata,
                     "empty_analysis",
                     "phase 1 returned no analysis; continuation was not attempted",
+                    raw_response=analysis_text,
+                )
+                continue
+            if self._phase1_contains_final_answer(analysis_text):
+                records[assignment.sample_id] = self._invalid_record(
+                    assignment,
+                    metadata,
+                    "phase1_contains_final_answer",
+                    "phase 1 contained an explicit final Yes/No answer; continuation was not attempted",
                     raw_response=analysis_text,
                 )
                 continue
@@ -740,9 +896,27 @@ class LogprobExperimentRunner(BaseExperimentRunner):
                             raw_response=raw if isinstance(raw, str) else None,
                         )
                         continue
-                    records[assignment.sample_id] = self._valid_score_record(
+                    candidate_record = self._valid_score_record(
                         assignment, metadata, response, analysis_text
                     )
+                    try:
+                        validate_logprob_value(
+                            candidate_record.value,
+                            sample_id=assignment.sample_id,
+                        )
+                    except CheckpointValidationError as exc:
+                        records[assignment.sample_id] = self._error_record(
+                            assignment,
+                            metadata,
+                            "phase2_response_schema_error",
+                            str(exc),
+                            value={
+                                "analysis_text": analysis_text,
+                                "analysis_text_kind": "model_generated_visible_text",
+                            },
+                        )
+                        continue
+                    records[assignment.sample_id] = candidate_record
 
         return [records[assignment.sample_id] for assignment in assignments]
 
@@ -906,7 +1080,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _default_results_dir() -> Path:
-    return Path(__file__).resolve().parents[2] / "results"
+    return default_results_directory()
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -914,6 +1088,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.dry_run and args.resume_from:
+        parser.error("--dry-run and --resume-from are mutually exclusive")
 
     results_dir = args.results_dir or _default_results_dir()
     if args.list_checkpoints:

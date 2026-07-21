@@ -440,6 +440,15 @@ class UnifiedLLMInterface:
             **kwargs,
         )
 
+    def preflight_continuation_scoring(self) -> dict[int, str]:
+        """Validate local bounded continuation scoring without inference."""
+
+        if self.use_api:
+            raise NotImplementedError(
+                "preflight_continuation_scoring is only available with the vLLM backend"
+            )
+        return self.interface.preflight_continuation_scoring()
+
     def extract_thinking(self, response_text: str) -> str:
         if self.use_api:
             return response_text

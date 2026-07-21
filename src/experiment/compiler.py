@@ -179,8 +179,7 @@ def compile_grouped_results(
         unknown_stages = set(expected_ids_by_stage).difference(inputs)
         if missing_stages:
             raise ValueError(
-                "expected_ids_by_stage is missing stage: "
-                f"{sorted(missing_stages)[0]}"
+                f"expected_ids_by_stage is missing stage: {sorted(missing_stages)[0]}"
             )
         if unknown_stages:
             raise ValueError(

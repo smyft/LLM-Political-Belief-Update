@@ -71,6 +71,12 @@ class Assignment(Protocol):
 PromptSpec = tuple[str, frozenset[str]]
 
 
+def default_results_directory() -> Path:
+    """Return a writable, installation-independent default output directory."""
+
+    return Path.cwd() / "results"
+
+
 class BaseExperimentRunner:
     """Backend-independent experiment planning and checkpoint lifecycle."""
 
@@ -255,7 +261,9 @@ class BaseExperimentRunner:
             else project_root / "src" / "prompts" / self.pipeline_name
         )
         self.results_dir = (
-            Path(results_dir) if results_dir is not None else project_root / "results"
+            Path(results_dir)
+            if results_dir is not None
+            else default_results_directory()
         )
         self.temperature = float(temperature)
         self.max_tokens = max_tokens
@@ -647,12 +655,10 @@ class BaseExperimentRunner:
         self._apply_extra_manifest_config(config)
 
     def _data_hashes(self) -> dict[str, str]:
-        return hash_files(
-            {
-                "entities.json": self.data_dir / "entities.json",
-                "proposal_actions.json": self.data_dir / "proposal_actions.json",
-            }
-        )
+        # Hash the same validated byte snapshots that produced the in-memory
+        # planning objects. Re-hashing only the current files could falsely bind
+        # a manifest to newer data while execution still uses an older cache.
+        return self.data_loader.snapshot_hashes(verify_files=True)
 
     @staticmethod
     def _source_tree_sha256() -> str:
@@ -748,6 +754,12 @@ class BaseExperimentRunner:
         dict[str, tuple[StageAssignment, ...]],
         TreatmentPlan,
     ]:
+        if self.llm_interface is not None:
+            raise CheckpointValidationError(
+                "checkpoint restore refuses to reuse an existing or injected backend; "
+                "create a fresh runner and provide a lazy llm_factory if a test or "
+                "application needs a custom backend"
+            )
         self._apply_manifest_config(manifest.config)
         self.load_prompt_templates()
         try:
@@ -904,15 +916,16 @@ class BaseExperimentRunner:
         if record.value == "No":
             return 0
         if isinstance(record.value, Mapping):
-            probabilities = record.value.get("probabilities")
-            if isinstance(probabilities, Mapping):
-                yes = probabilities.get("Yes")
-                no = probabilities.get("No")
-                if isinstance(yes, (int, float)) and isinstance(no, (int, float)):
-                    if yes > no:
-                        return 1
-                    if no > yes:
-                        return 0
+            # Logprob records measure an actually sampled, format-valid answer;
+            # aggregate candidate mass is diagnostic and must not replace that
+            # observed Yes/No token with an argmax-derived pseudo-response.
+            if record.value.get("format_valid") is not True:
+                return None
+            sampled_choice = record.value.get("sampled_choice")
+            if sampled_choice == "Yes":
+                return 1
+            if sampled_choice == "No":
+                return 0
         return None
 
     def _resolve_treatments(
