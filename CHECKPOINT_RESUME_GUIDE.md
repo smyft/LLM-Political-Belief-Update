@@ -2,9 +2,9 @@
 
 ## 1. 适用范围
 
-本文说明 `verbalize` 与 `logprob` 两个实验 runner 的版本化 checkpoint 和恢复机制。未传 `--results-dir` 时，无论从源码仓库还是 wheel 运行，默认结果目录都是**当前工作目录**下的 `results/`。从仓库根目录运行时，它自然就是仓库根下的 `results/`。本文的真实运行与恢复示例仍显式传入 `--results-dir`，避免依赖启动时所在目录。
+本文说明 `verbalize` 与 `logprob` 两个实验 runner 的版本化 checkpoint 和恢复机制。未传 `--results-dir` 时，默认结果目录是**当前工作目录**下的 `results/`；从源码仓库根目录运行时，它自然就是仓库根下的 `results/`。本文的真实运行与恢复示例仍显式传入 `--results-dir`，避免依赖启动时所在目录。
 
-`data/proposal2action.py` 使用的是另一套相邻 `*.partial.json` 机制，不使用本文所述的 stage checkpoint。其 schema version 2 会校验模型、输入、prompt、选择计划、固定生成参数、规范化 OpenRouter endpoint，以及 generator 与统一 model interface 的源码 fingerprint；旧 schema 不兼容。该脚本的恢复方法见 README 的 “Generate proposal-to-action data” 部分。
+`data/proposal2action.py` 使用的是另一套相邻 `*.partial.json` 机制，不使用本文所述的 stage checkpoint。其 schema version 2 会校验模型、输入、prompt、选择计划、固定生成参数、规范化 OpenRouter endpoint，以及 generator 与统一 model interface 的源码 fingerprint；旧 schema 不兼容。该脚本的恢复方法见 README 的 “Optional action-data regeneration” 部分。
 
 ## 2. 核心语义
 

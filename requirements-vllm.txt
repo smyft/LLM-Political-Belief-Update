@@ -1,3 +1,0 @@
-# Install only on a supported accelerator/OS after following the vLLM guide.
-# vLLM resolves its compatible torch and numerical stack; do not pre-pin torch here.
-vllm==0.24.0

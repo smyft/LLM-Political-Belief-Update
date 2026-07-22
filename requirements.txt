@@ -1,5 +1,6 @@
-# CPU/API runtime dependencies tested with Python 3.11 and 3.12.
-# vLLM is intentionally separated into requirements-vllm.txt.
+# Runtime dependencies for API and local vLLM execution.
+# vLLM resolves its compatible torch and numerical stack; do not pre-pin torch here.
 httpx==0.28.1
 python-dotenv==1.1.0
 tqdm==4.68.3
+vllm==0.24.0
