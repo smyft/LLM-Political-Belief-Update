@@ -78,7 +78,16 @@ def extract_thinking_process(text: str) -> str:
     if match_incomplete:
         return match_incomplete.group(1).strip()
 
-    # Strategy 3: No tags - return the original text with answer filtering
+    # Some chat templates prefill the opening tag in the assistant prompt, so
+    # the completion contains reasoning followed only by a closing tag.
+    closing_only_pattern = re.compile(
+        rf"^(.*?){re.escape(THINK_END_TAG)}", re.DOTALL | re.IGNORECASE
+    )
+    match_closing_only = closing_only_pattern.search(text)
+    if match_closing_only:
+        return match_closing_only.group(1).strip()
+
+    # No tags - return the original text with answer filtering.
     return filter_answer_from_text(text)
 
 
@@ -133,6 +142,10 @@ class VLLMInterface:
         code_revision: str | None = None,
         dtype: str = "auto",
         enforce_eager: bool = False,
+        max_model_len: int | None = None,
+        max_num_seqs: int | None = None,
+        language_model_only: bool = False,
+        enable_thinking: bool | None = None,
         **kwargs,
     ):
         """
@@ -148,6 +161,10 @@ class VLLMInterface:
             code_revision: Optional remote-code branch, tag, or commit identifier
             dtype: Data type for model weights
             enforce_eager: Whether to use eager mode (recommended for compatibility)
+            max_model_len: Optional context-length cap passed to vLLM
+            max_num_seqs: Optional scheduler sequence cap passed to vLLM
+            language_model_only: Skip multimodal towers for text-only inference
+            enable_thinking: Optional chat-template thinking-mode switch
             **kwargs: Additional arguments for vLLM
         """
         if not VLLM_AVAILABLE:
@@ -164,12 +181,16 @@ class VLLMInterface:
         self.code_revision = code_revision
         self.dtype = dtype
         self.enforce_eager = enforce_eager
+        self.max_model_len = max_model_len
+        self.max_num_seqs = max_num_seqs
+        self.language_model_only = language_model_only
+        self.enable_thinking = enable_thinking
         self.extra_kwargs = kwargs
 
         self.llm = None
         self.tokenizer = None
         self._yes_no_candidate_map = None
-        self._continuation_preflight_complete = False
+        self._bounded_scoring_preflight_complete = False
 
     def load_model(self):
         """Load the model into memory."""
@@ -180,6 +201,13 @@ class VLLMInterface:
             return
 
         print(f"Loading model: {self.model_name}...")
+        engine_kwargs = dict(self.extra_kwargs)
+        if self.max_model_len is not None:
+            engine_kwargs["max_model_len"] = self.max_model_len
+        if self.max_num_seqs is not None:
+            engine_kwargs["max_num_seqs"] = self.max_num_seqs
+        engine_kwargs["language_model_only"] = self.language_model_only
+
         self.llm = LLM(
             model=self.model_name,
             trust_remote_code=self.trust_remote_code,
@@ -190,7 +218,7 @@ class VLLMInterface:
             tensor_parallel_size=self.tensor_parallel_size,
             dtype=self.dtype,
             enforce_eager=self.enforce_eager,
-            **self.extra_kwargs,
+            **engine_kwargs,
         )
         self.tokenizer = self.llm.get_tokenizer()
         print("Model loaded successfully.")
@@ -204,7 +232,7 @@ class VLLMInterface:
             self._yes_no_candidate_map = build_yes_no_candidate_map(self.tokenizer)
         return self._yes_no_candidate_map
 
-    def _ensure_continuation_api(self) -> None:
+    def _ensure_bounded_scoring_api(self) -> None:
         """Fail clearly instead of changing prompt semantics on old vLLM APIs."""
 
         try:
@@ -214,17 +242,121 @@ class VLLMInterface:
                 "Unable to inspect the installed vLLM chat API."
             ) from exc
 
-        required = {"use_tqdm", "add_generation_prompt", "continue_final_message"}
+        required = {
+            "use_tqdm",
+            "add_generation_prompt",
+            "continue_final_message",
+            "chat_template_kwargs",
+        }
         missing = sorted(required.difference(parameters))
         if missing:
             raise RuntimeError(
-                "The installed vLLM is incompatible with continuation scoring; "
+                "The installed vLLM is incompatible with bounded scoring; "
                 "missing LLM.chat parameters: " + ", ".join(missing)
             )
 
+    def _validate_bounded_scoring_chat_template(self) -> None:
+        """Validate the completed-analysis, fresh-assistant scoring contract."""
+
+        apply_chat_template = getattr(self.tokenizer, "apply_chat_template", None)
+        if not callable(apply_chat_template):
+            raise RuntimeError(
+                "The tokenizer is incompatible with bounded scoring: "
+                "apply_chat_template() is unavailable."
+            )
+
+        user_marker = "LLM_BELIEF_ANALYSIS_REQUEST_MARKER_7F31"
+        analysis_marker = "LLM_BELIEF_VISIBLE_ANALYSIS_MARKER_4A92"
+        request_marker = "LLM_BELIEF_BINARY_REQUEST_MARKER_9C26"
+        answer_marker = "LLM_BELIEF_BINARY_ANSWER_MARKER_2D84"
+        user_message = {"role": "user", "content": user_marker}
+        assistant_message = {"role": "assistant", "content": analysis_marker}
+        scoring_request = {"role": "user", "content": request_marker}
+        template_kwargs = self._chat_template_kwargs() or {}
+
+        def render(
+            messages: list[dict[str, str]], *, add_generation_prompt: bool
+        ) -> str:
+            value = apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=add_generation_prompt,
+                continue_final_message=False,
+                **template_kwargs,
+            )
+            if not isinstance(value, str):
+                raise TypeError("chat template must return text when tokenize=False")
+            return value
+
+        try:
+            phase1_prefix = render([user_message], add_generation_prompt=True)
+            completed_analysis = render(
+                [user_message, assistant_message], add_generation_prompt=False
+            )
+            completed_scoring_dialogue = render(
+                [user_message, assistant_message, scoring_request],
+                add_generation_prompt=False,
+            )
+            scoring_prefix = render(
+                [user_message, assistant_message, scoring_request],
+                add_generation_prompt=True,
+            )
+            completed_answer = render(
+                [
+                    user_message,
+                    assistant_message,
+                    scoring_request,
+                    {"role": "assistant", "content": answer_marker},
+                ],
+                add_generation_prompt=False,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "The tokenizer chat template is incompatible with bounded "
+                "scoring after a completed analysis turn."
+            ) from exc
+
+        if not completed_analysis.startswith(phase1_prefix + analysis_marker):
+            raise RuntimeError(
+                "The tokenizer chat template cannot reconstruct phase-1 visible "
+                "analysis as assistant content."
+            )
+        marker_indexes = [
+            scoring_prefix.find(marker)
+            for marker in (user_marker, analysis_marker, request_marker)
+        ]
+        if (
+            any(index < 0 for index in marker_indexes)
+            or marker_indexes != sorted(marker_indexes)
+            or any(
+                scoring_prefix.count(marker) != 1
+                for marker in (
+                    user_marker,
+                    analysis_marker,
+                    request_marker,
+                )
+            )
+        ):
+            raise RuntimeError(
+                "The tokenizer chat template must preserve the analysis dialogue "
+                "and final user request in order."
+            )
+        if not scoring_prefix.startswith(completed_scoring_dialogue) or len(
+            scoring_prefix
+        ) == len(completed_scoring_dialogue):
+            raise RuntimeError(
+                "The tokenizer chat template does not append a fresh assistant "
+                "generation prompt for bounded scoring."
+            )
+        if not completed_answer.startswith(scoring_prefix + answer_marker):
+            raise RuntimeError(
+                "The tokenizer chat template does not place the bounded token at "
+                "the start of visible assistant answer content."
+            )
+
     @staticmethod
-    def _build_continuation_sampling_params(candidate_token_ids: list[int], **kwargs):
-        """Construct the pinned vLLM continuation-scoring parameter contract."""
+    def _build_bounded_sampling_params(candidate_token_ids: list[int], **kwargs):
+        """Construct the pinned vLLM bounded-scoring parameter contract."""
 
         try:
             return SamplingParams(
@@ -235,13 +367,13 @@ class VLLMInterface:
             )
         except TypeError as exc:
             raise RuntimeError(
-                "The installed vLLM SamplingParams is incompatible with continuation "
+                "The installed vLLM SamplingParams is incompatible with bounded "
                 "scoring; logprob_token_ids support from vLLM 0.24 or a "
                 "compatible release is required."
             ) from exc
 
-    def preflight_continuation_scoring(self) -> dict[int, str]:
-        """Load once and validate bounded continuation scoring without inference.
+    def preflight_bounded_scoring(self) -> dict[int, str]:
+        """Load once and validate bounded first-token scoring without inference.
 
         The returned candidate map is detached from the cached tokenizer-specific
         map so callers cannot mutate later scoring behavior.
@@ -249,17 +381,17 @@ class VLLMInterface:
 
         if self.llm is None or self.tokenizer is None:
             self.load_model()
-        if not self._continuation_preflight_complete:
-            self._ensure_continuation_api()
+        if not self._bounded_scoring_preflight_complete:
+            self._ensure_bounded_scoring_api()
+            self._validate_bounded_scoring_chat_template()
             candidate_map = self._get_yes_no_candidate_map()
-            self._build_continuation_sampling_params(list(candidate_map))
-            self._continuation_preflight_complete = True
+            self._build_bounded_sampling_params(list(candidate_map))
+            self._bounded_scoring_preflight_complete = True
         return dict(self._get_yes_no_candidate_map())
 
     def _normalize_and_validate_dialogues(
         self,
         dialogue_history: list[dict] | list[list[dict]],
-        require_assistant_last: bool = False,
     ) -> list[list[dict]]:
         """
         Normalize input to batched OpenAI-style dialogues and validate schema.
@@ -267,8 +399,6 @@ class VLLMInterface:
         Args:
             dialogue_history: A single dialogue ([{role, content}, ...]) or
                               a batch of dialogues ([[{role, content}, ...], ...])
-            require_assistant_last: Whether the final message must be assistant
-
         Returns:
             Normalized list of dialogues.
         """
@@ -310,17 +440,26 @@ class VLLMInterface:
                     raise TypeError(
                         f"'role' and 'content' at dialogue[{d_idx}][{m_idx}] must both be strings."
                     )
-
-            if (
-                require_assistant_last
-                and dialogue[-1]["role"].strip().lower() != "assistant"
-            ):
-                raise ValueError(
-                    f"Dialogue at index {d_idx} must end with an assistant message when "
-                    "using continuation mode."
-                )
+                if "reasoning_content" in msg:
+                    if not isinstance(msg["reasoning_content"], str):
+                        raise TypeError(
+                            "'reasoning_content' at "
+                            f"dialogue[{d_idx}][{m_idx}] must be a string."
+                        )
+                    if msg["role"].strip().lower() != "assistant":
+                        raise ValueError(
+                            "'reasoning_content' is only valid on assistant messages; "
+                            f"found it at dialogue[{d_idx}][{m_idx}]."
+                        )
 
         return dialogues
+
+    def _chat_template_kwargs(self) -> dict[str, bool] | None:
+        """Return a fresh, manifest-controlled chat-template configuration."""
+
+        if self.enable_thinking is None:
+            return None
+        return {"enable_thinking": self.enable_thinking}
 
     def chat(
         self,
@@ -370,6 +509,7 @@ class VLLMInterface:
             dialogues,
             sampling_params=sampling_params,
             use_tqdm=show_progress,
+            chat_template_kwargs=self._chat_template_kwargs(),
         )
 
         # Process outputs
@@ -392,50 +532,35 @@ class VLLMInterface:
 
         return results
 
-    def chat_with_continuation(
+    def _chat_with_bounded_candidate_scores(
         self,
         dialogue_history: list[dict] | list[list[dict]],
-        temperature: float = 0,
-        max_tokens: int = 1,
-        seed: int = 42,
-        logprobs: int = 20,
-        show_progress: bool = True,
-        desc: str = "Processing",
-        **kwargs,
+        *,
+        temperature: float,
+        max_tokens: int,
+        seed: int,
+        logprobs: int | None,
+        show_progress: bool,
+        last_role: str,
+        add_generation_prompt: bool,
+        continue_final_message: bool,
+        kwargs: dict,
     ) -> list[dict]:
-        """
-        Generate responses by continuing the last assistant message.
+        """Run the shared finite-candidate, one-token scoring implementation."""
 
-        This is used for Phase 2 of the logprob experiment where we want to
-        extract the next token probabilities after the thinking process.
+        candidate_map = self.preflight_bounded_scoring()
 
-        Args:
-            dialogue_history: List of dialogues where the last message is from assistant
-                             and should be continued
-            temperature: Sampling temperature
-            max_tokens: Maximum tokens to generate (usually 1 for logprob extraction)
-            seed: Random seed
-            logprobs: Retained for runner compatibility. Continuation scoring
-                      requests the finite candidate IDs directly instead of a
-                      top-K or full-vocabulary distribution.
-            show_progress: Whether to show progress bar
-            desc: Description for progress bar
-            **kwargs: Additional arguments for SamplingParams
-
-        Returns:
-            List of response dictionaries containing generated_text, logprobs, and probabilities
-        """
-        candidate_map = self.preflight_continuation_scoring()
-
-        # Normalize input to list of dialogues and validate OpenAI-style schema
-        dialogues = self._normalize_and_validate_dialogues(
-            dialogue_history, require_assistant_last=True
-        )
+        dialogues = self._normalize_and_validate_dialogues(dialogue_history)
+        for index, dialogue in enumerate(dialogues):
+            actual_role = dialogue[-1]["role"].strip().lower()
+            if actual_role != last_role:
+                raise ValueError(
+                    f"Dialogue at index {index} must end with a {last_role} "
+                    "message for bounded scoring."
+                )
 
         if max_tokens != 1:
-            raise ValueError(
-                "Continuation probability extraction requires max_tokens=1."
-            )
+            raise ValueError("Bounded probability extraction requires max_tokens=1.")
         if logprobs is not None and (not isinstance(logprobs, int) or logprobs < 1):
             raise ValueError("logprobs must be a positive integer when provided.")
 
@@ -453,14 +578,14 @@ class VLLMInterface:
         duplicate_keys = reserved_sampling_keys.intersection(kwargs)
         if duplicate_keys:
             raise ValueError(
-                "continuation kwargs cannot override: "
+                "bounded-scoring kwargs cannot override: "
                 + ", ".join(sorted(duplicate_keys))
             )
 
         # vLLM 0.24 returns exactly these bounded candidate logprobs plus the
         # sampled token. Do not set `logprobs`, especially not -1, because that
         # would request a top-K or full-vocabulary distribution.
-        sampling_params = self._build_continuation_sampling_params(
+        sampling_params = self._build_bounded_sampling_params(
             candidate_token_ids,
             temperature=temperature,
             seed=seed,
@@ -471,8 +596,9 @@ class VLLMInterface:
             dialogues,
             sampling_params=sampling_params,
             use_tqdm=show_progress,
-            add_generation_prompt=False,
-            continue_final_message=True,
+            add_generation_prompt=add_generation_prompt,
+            continue_final_message=continue_final_message,
+            chat_template_kwargs=self._chat_template_kwargs(),
         )
 
         # Process outputs
@@ -516,6 +642,38 @@ class VLLMInterface:
 
         return results
 
+    def chat_with_bounded_candidates(
+        self,
+        dialogue_history: list[dict] | list[list[dict]],
+        temperature: float = 0,
+        max_tokens: int = 1,
+        seed: int = 42,
+        logprobs: int | None = 20,
+        show_progress: bool = True,
+        desc: str = "Processing",
+        **kwargs,
+    ) -> list[dict]:
+        """Score the first token of a fresh assistant turn.
+
+        The dialogue must end with the user request that follows a completed
+        assistant analysis turn. ``desc`` is accepted for the common backend
+        interface; progress rendering is delegated to vLLM.
+        """
+
+        del desc
+        return self._chat_with_bounded_candidate_scores(
+            dialogue_history,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            seed=seed,
+            logprobs=logprobs,
+            show_progress=show_progress,
+            last_role="user",
+            add_generation_prompt=True,
+            continue_final_message=False,
+            kwargs=kwargs,
+        )
+
     def extract_thinking(self, response_text: str) -> str:
         """
         Extract the thinking process from a response.
@@ -536,7 +694,7 @@ class VLLMInterface:
         self.llm = None
         self.tokenizer = None
         self._yes_no_candidate_map = None
-        self._continuation_preflight_complete = False
+        self._bounded_scoring_preflight_complete = False
         try:
             if llm is not None:
                 # Use a public close hook when a vLLM release provides one;
@@ -590,24 +748,25 @@ if __name__ == "__main__":
             )
             print("Phase 1 thinking:", results_with_logprobs)
 
-            # Test continuation for logprob extraction
-            continuation_dialogues = [
+            # Test bounded first-token scoring on a fresh assistant turn
+            scoring_dialogues = [
                 [
                     {"role": "user", "content": "Is 2+2=4? Answer Yes or No."},
                     {
                         "role": "assistant",
-                        "content": "Let me think. 2+2 equals 4. So my answer is",
+                        "content": "2+2 equals 4.",
                     },
+                    {"role": "user", "content": "Answer exactly Yes or No."},
                 ],
             ]
 
-            continuation_results = interface.chat_with_continuation(
-                continuation_dialogues,
+            scoring_results = interface.chat_with_bounded_candidates(
+                scoring_dialogues,
                 max_tokens=1,
                 logprobs=20,
-                desc="Testing continuation",
+                desc="Testing bounded scoring",
             )
-            print("Continuation result:", continuation_results)
+            print("Bounded-scoring result:", scoring_results)
 
             interface.free_memory()
             print("Test completed successfully!")

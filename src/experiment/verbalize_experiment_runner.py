@@ -78,6 +78,66 @@ class VerbalizeExperimentRunner(BaseExperimentRunner):
         ),
     }
 
+    def __init__(
+        self,
+        model_name: str,
+        *,
+        use_api: bool = False,
+        max_model_len: int | None = None,
+        max_num_seqs: int | None = None,
+        language_model_only: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        """Initialize a strict-JSON runner with a backend-specific thinking contract.
+
+        Local chat templates must not emit a reasoning preamble around the JSON
+        object, so thinking is always disabled for vLLM. Hosted APIs do not expose
+        this chat-template switch and therefore retain the provider-managed mode.
+        """
+
+        if "enable_thinking" in kwargs:
+            raise TypeError(
+                "VerbalizeExperimentRunner fixes enable_thinking from the backend; "
+                "callers cannot override it"
+            )
+        super().__init__(
+            model_name=model_name,
+            use_api=use_api,
+            max_model_len=max_model_len,
+            max_num_seqs=max_num_seqs,
+            language_model_only=language_model_only,
+            enable_thinking=None if use_api else False,
+            **kwargs,
+        )
+
+    def _thinking_mode(self) -> str:
+        return "provider_managed" if self.use_api else "disabled_via_chat_template"
+
+    def _extra_manifest_config(self) -> Mapping[str, Any]:
+        return {"thinking_mode": self._thinking_mode()}
+
+    def _apply_extra_manifest_config(self, config: Mapping[str, Any]) -> None:
+        expected_mode = self._thinking_mode()
+        if config.get("thinking_mode") != expected_mode:
+            raise CheckpointValidationError(
+                "checkpoint has an incompatible verbalize thinking-mode contract"
+            )
+        expected_switch = None if self.use_api else False
+        if self.enable_thinking is not expected_switch:
+            raise CheckpointValidationError(
+                "checkpoint vLLM thinking switch does not match the verbalize contract"
+            )
+
+    def initialize_llm(self) -> Any:
+        """Initialize and verify the strict local chat-template contract."""
+
+        backend = super().initialize_llm()
+        if not self.use_api and getattr(backend, "enable_thinking", None) is not False:
+            raise RuntimeError(
+                "local verbalize backend must explicitly declare enable_thinking=False"
+            )
+        return backend
+
     def _distribution_text(self, assignment: TreatmentAssignment) -> str | None:
         condition = assignment.condition
         if condition.kind == "fixed_hypothetical_survey":
@@ -418,6 +478,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tensor-parallel-size", type=_positive_int, default=1)
     parser.add_argument("--dtype", default="auto")
     parser.add_argument("--enforce-eager", action="store_true")
+    parser.add_argument(
+        "--max-model-len",
+        type=_positive_int,
+        help="Cap vLLM context length; must exceed --max-tokens",
+    )
+    parser.add_argument(
+        "--max-num-seqs",
+        type=_positive_int,
+        help="Cap the number of sequences scheduled concurrently by vLLM",
+    )
+    parser.add_argument(
+        "--language-model-only",
+        action="store_true",
+        help="Skip multimodal towers for text-only local inference",
+    )
 
     parser.add_argument(
         "--dry-run", action="store_true", help="plan and print counts only"
@@ -463,6 +538,9 @@ def _runner_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         "tensor_parallel_size": args.tensor_parallel_size,
         "dtype": args.dtype,
         "enforce_eager": args.enforce_eager,
+        "max_model_len": args.max_model_len,
+        "max_num_seqs": args.max_num_seqs,
+        "language_model_only": args.language_model_only,
         "show_progress": not args.no_progress,
     }
 

@@ -149,6 +149,39 @@ def test_invalid_entities_fail_fast(tmp_path: Path, entities: object) -> None:
         DataLoader(str(tmp_path)).load_entities()
 
 
+def test_entities_reject_reserved_none_persona_at_load_boundary(tmp_path: Path) -> None:
+    _write_json(
+        tmp_path / "entities.json",
+        {"politicians": ["none"], "platforms": []},
+    )
+
+    with pytest.raises(ValueError, match="persona label 'none' is reserved"):
+        DataLoader(str(tmp_path)).load_entities()
+
+
+@pytest.mark.parametrize(
+    "raw_json",
+    [
+        '{"politicians":["\\ud800"],"platforms":[]}',
+        '{"politicians":[],"platforms":[],"\\udfff":[]}',
+    ],
+)
+def test_data_json_rejects_unpaired_surrogates(tmp_path: Path, raw_json: str) -> None:
+    (tmp_path / "entities.json").write_text(raw_json, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="unpaired UTF-16 surrogate"):
+        DataLoader(str(tmp_path)).load_entities()
+
+
+def test_data_json_accepts_valid_supplementary_unicode(tmp_path: Path) -> None:
+    _write_json(
+        tmp_path / "entities.json",
+        {"politicians": ["Person 😀"], "platforms": []},
+    )
+
+    assert DataLoader(str(tmp_path)).load_entities()["politicians"] == ["Person 😀"]
+
+
 @pytest.mark.parametrize(
     "proposals",
     [

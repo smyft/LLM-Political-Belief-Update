@@ -1,6 +1,7 @@
 import json
 import math
 import shutil
+from types import SimpleNamespace
 
 import pytest
 
@@ -25,11 +26,14 @@ class FakeBackend:
         chat_results=None,
         continuation_results=None,
         chat_error=None,
+        continuation_error=None,
         preflight_error=None,
     ):
+        self.enable_thinking = False
         self.chat_results = list(chat_results or [])
         self.continuation_results = list(continuation_results or [])
         self.chat_error = chat_error
+        self.continuation_error = continuation_error
         self.preflight_error = preflight_error
         self.preflight_calls = 0
         self.chat_calls = []
@@ -37,11 +41,14 @@ class FakeBackend:
         self.call_order = []
         self.closed = False
 
-    def preflight_continuation_scoring(self):
+    def preflight_bounded_scoring(self):
         self.preflight_calls += 1
         self.call_order.append("preflight")
         if self.preflight_error is not None:
             raise self.preflight_error
+
+    def preflight_continuation_scoring(self):
+        raise AssertionError("runner must use fresh-turn bounded scoring")
 
     def chat(self, **kwargs):
         self.chat_calls.append(kwargs)
@@ -50,10 +57,16 @@ class FakeBackend:
             raise self.chat_error
         return self.chat_results.pop(0)
 
-    def chat_with_continuation(self, **kwargs):
+    def chat_with_bounded_candidates(self, **kwargs):
         self.continuation_calls.append(kwargs)
         self.call_order.append("continuation")
+        if self.continuation_error is not None:
+            raise self.continuation_error
         return self.continuation_results.pop(0)
+
+    def chat_with_continuation(self, **kwargs):
+        del kwargs
+        raise AssertionError("runner must not use assistant-message continuation")
 
     def close(self):
         self.closed = True
@@ -83,7 +96,7 @@ class AdaptiveFakeBackend(FakeBackend):
             responses.append({"generated_text": text, "finish_reason": "stop"})
         return responses
 
-    def chat_with_continuation(self, **kwargs):
+    def chat_with_bounded_candidates(self, **kwargs):
         self.continuation_calls.append(kwargs)
         self.call_order.append("continuation")
         count = len(kwargs["dialogue_history"])
@@ -208,6 +221,14 @@ def test_prompt_specs_validate_every_exact_placeholder_set(tmp_path):
     runner = make_runner(FakeBackend())
 
     assert set(runner.load_prompt_templates()) == set(runner.prompt_specs)
+    for name in {
+        "step1_phase2",
+        "step3_phase2",
+        "step4a_phase2",
+        "step4b_phase2",
+    }:
+        assert runner.prompt_specs[name][1] == frozenset()
+        assert "{ANALYSIS_TEXT}" not in runner.prompt_templates[name]
 
     prompts = tmp_path / "prompts"
     shutil.copytree(runner.prompts_dir, prompts)
@@ -262,21 +283,32 @@ def test_preflight_is_bound_to_backend_identity_and_reset_by_cleanup():
     second = FakeBackend()
     runner = make_runner(first)
 
-    assert runner._preflight_continuation_scoring() is first
-    assert runner._preflight_continuation_scoring() is first
+    assert runner._preflight_bounded_scoring() is first
+    assert runner._preflight_bounded_scoring() is first
     runner.llm_interface = second
-    assert runner._preflight_continuation_scoring() is second
+    assert runner._preflight_bounded_scoring() is second
 
     assert first.preflight_calls == 1
     assert second.preflight_calls == 1
 
     runner.cleanup()
     runner.llm_interface = second
-    assert runner._preflight_continuation_scoring() is second
+    assert runner._preflight_bounded_scoring() is second
     assert second.preflight_calls == 2
 
 
-def test_binary_stage_passes_generated_analysis_into_bounded_continuation():
+def test_preflight_rejects_backend_without_disabled_thinking_contract():
+    backend = FakeBackend()
+    backend.enable_thinking = True
+    runner = make_runner(backend)
+
+    with pytest.raises(RuntimeError, match="must declare enable_thinking=False"):
+        runner._preflight_bounded_scoring()
+
+    assert backend.preflight_calls == 0
+
+
+def test_binary_stage_scores_fresh_turn_after_completed_visible_analysis():
     backend = FakeBackend(
         chat_results=[
             [{"generated_text": "MODEL ANALYSIS {policy}", "finish_reason": "stop"}]
@@ -299,9 +331,15 @@ def test_binary_stage_passes_generated_analysis_into_bounded_continuation():
     assert record.value["format_valid"] is True
 
     continuation = backend.continuation_calls[0]
-    assistant_prefix = continuation["dialogue_history"][0][-1]
-    assert assistant_prefix["role"] == "assistant"
-    assert "MODEL ANALYSIS {policy}" in assistant_prefix["content"]
+    dialogue = continuation["dialogue_history"][0]
+    assert dialogue[-2] == {
+        "role": "assistant",
+        "content": "MODEL ANALYSIS {policy}",
+    }
+    assert dialogue[-1]["role"] == "user"
+    assert "MODEL ANALYSIS {policy}" not in dialogue[-1]["content"]
+    assert "Respond with exactly Yes or No" in dialogue[-1]["content"]
+    assert all("reasoning_content" not in message for message in dialogue)
     assert continuation["max_tokens"] == 1
     assert continuation["temperature"] == 0.0
     assert "logprobs" not in continuation
@@ -486,6 +524,41 @@ def test_step2_uses_strict_percentage_json_and_never_calls_continuation():
     assert backend.continuation_calls == []
 
 
+def test_step2_truncation_is_reported_before_json_parsing():
+    backend = FakeBackend(
+        chat_results=[
+            [{"generated_text": '{"analysis":"unfinished', "finish_reason": "length"}]
+        ]
+    )
+    runner = make_runner(backend)
+
+    record = runner._execute_stage_chunk("step2", [baseline_assignment("step2")])[0]
+
+    assert record.status is ResultStatus.INVALID
+    assert record.error_code == "step2_truncated"
+    assert record.raw_response == '{"analysis":"unfinished'
+
+
+def test_step2_finish_reason_schema_error_is_per_sample_error():
+    backend = FakeBackend(
+        chat_results=[
+            [
+                {
+                    "generated_text": '{"analysis":"estimate","answer":50}',
+                    "finish_reason": 7,
+                }
+            ]
+        ]
+    )
+    runner = make_runner(backend)
+
+    record = runner._execute_stage_chunk("step2", [baseline_assignment("step2")])[0]
+
+    assert record.status is ResultStatus.ERROR
+    assert record.error_code == "backend_response_schema_error"
+    assert "finish_reason" in record.error_message
+
+
 def test_unavailable_simulated_consensus_is_invalid_without_any_model_call():
     backend = FakeBackend(chat_error=AssertionError("backend must not be called"))
     runner = make_runner(backend)
@@ -573,6 +646,16 @@ def test_treatment_prompt_contracts_are_distinct_and_retest_reuses_baseline():
             ResultStatus.ERROR,
             "phase2_response_schema_error",
         ),
+        (
+            {
+                "generated_text": "Maybe",
+                "finish_reason": 7,
+                "valid": False,
+                "error": "sampled_token_outside_yes_no_candidates",
+            },
+            ResultStatus.ERROR,
+            "phase2_response_schema_error",
+        ),
     ],
 )
 def test_continuation_invalid_scores_and_backend_schema_errors_are_not_imputed(
@@ -592,15 +675,27 @@ def test_continuation_invalid_scores_and_backend_schema_errors_are_not_imputed(
     assert LogprobExperimentRunner._binary_decision(record) is None
 
 
-def test_backend_exception_becomes_explicit_error_record():
+@pytest.mark.parametrize("stage", ["step2", "step3"])
+def test_backend_batch_exception_is_fatal_and_leaves_chunk_retryable(stage):
     backend = FakeBackend(chat_error=RuntimeError("GPU unavailable"))
     runner = make_runner(backend)
 
-    record = runner._execute_stage_chunk("step3", [baseline_assignment("step3")])[0]
+    with pytest.raises(RuntimeError, match="chunk was left incomplete") as exc_info:
+        runner._execute_stage_chunk(stage, [baseline_assignment(stage)])
 
-    assert record.status is ResultStatus.ERROR
-    assert record.error_code == "phase1_backend_error"
-    assert "GPU unavailable" in record.error_message
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+    assert "GPU unavailable" in str(exc_info.value.__cause__)
+
+
+def test_continuation_batch_exception_is_fatal_and_leaves_chunk_retryable():
+    backend = FakeBackend(
+        chat_results=[[{"generated_text": "analysis", "finish_reason": "stop"}]],
+        continuation_error=RuntimeError("CUDA out of memory"),
+    )
+    runner = make_runner(backend)
+
+    with pytest.raises(RuntimeError, match="phase-2.*chunk was left incomplete"):
+        runner._execute_stage_chunk("step1", [baseline_assignment("step1")])
 
 
 def test_logprob_pipeline_rejects_api_and_estimates_two_phase_sequences():
@@ -619,7 +714,26 @@ def test_logprob_pipeline_rejects_api_and_estimates_two_phase_sequences():
     assert runner._extra_manifest_config() == {
         "binary_estimator": "bounded_single_token_candidate_set",
         "scoring_temperature": 0.0,
+        "thinking_mode": "disabled_via_chat_template",
+        "bounded_scoring_protocol": ("completed_analysis_new_user_fresh_assistant_v1"),
     }
+
+
+def test_logprob_checkpoint_requires_fresh_turn_scoring_contract():
+    runner = make_runner(FakeBackend())
+    config = runner._extra_manifest_config()
+
+    runner._apply_extra_manifest_config(config)
+
+    incompatible = dict(config)
+    incompatible.pop("bounded_scoring_protocol")
+    with pytest.raises(ValueError, match="bounded-scoring protocol"):
+        runner._apply_extra_manifest_config(incompatible)
+
+    incompatible = dict(config)
+    incompatible["bounded_scoring_protocol"] = "assistant_reasoning_content"
+    with pytest.raises(ValueError, match="bounded-scoring protocol"):
+        runner._apply_extra_manifest_config(incompatible)
 
 
 def test_model_revision_and_remote_code_opt_in_reach_lazy_factory():
@@ -644,6 +758,7 @@ def test_model_revision_and_remote_code_opt_in_reach_lazy_factory():
     assert captured["tokenizer_revision"] == "0123456789abcdef"
     assert captured["code_revision"] == "0123456789abcdef"
     assert captured["trust_remote_code"] is True
+    assert captured["enable_thinking"] is False
 
 
 def test_parser_reads_real_argv_and_exposes_reproducibility_and_treatments():
@@ -666,6 +781,11 @@ def test_parser_reads_real_argv_and_exposes_reproducibility_and_treatments():
             "80",
             "--no-placebo",
             "--trust-remote-code",
+            "--max-model-len",
+            "4096",
+            "--max-num-seqs",
+            "16",
+            "--language-model-only",
             "--resume-from",
             "logprob-run",
             "--resume-step",
@@ -682,6 +802,9 @@ def test_parser_reads_real_argv_and_exposes_reproducibility_and_treatments():
     assert args.fixed_percentages == [20.0, 80.0]
     assert args.no_placebo is True
     assert args.trust_remote_code is True
+    assert args.max_model_len == 4096
+    assert args.max_num_seqs == 16
+    assert args.language_model_only is True
     assert args.resume_from == "logprob-run"
     assert args.resume_step == "step4a"
 
@@ -746,6 +869,9 @@ def test_tiny_end_to_end_run_uses_fake_backend_and_compiles_explicit_statuses(tm
     payload = json.loads(output.read_text(encoding="utf-8"))
 
     assert payload["pipeline"] == "logprob"
+    assert payload["manifest"]["config"]["bounded_scoring_protocol"] == (
+        "completed_analysis_new_user_fresh_assistant_v1"
+    )
     assert len(payload["results"]) == 1
     row = payload["results"][0]
     assert len(row["step1_first_order_belief"]) == 1
@@ -791,6 +917,34 @@ def test_main_uses_passed_argv_not_process_argv(monkeypatch, tmp_path):
         )
         == 0
     )
+
+
+def test_main_prints_batch_failure_root_cause_and_run_id(monkeypatch, tmp_path, capsys):
+    def fail_with_cause(self, **kwargs):
+        del kwargs
+        self.active_manifest = SimpleNamespace(run_id="test-run-id")
+        try:
+            raise OSError("GPU worker exited")
+        except OSError as cause:
+            raise RuntimeError("Step 1 vLLM batch failed") from cause
+
+    monkeypatch.setattr(LogprobExperimentRunner, "run_experiments", fail_with_cause)
+
+    assert (
+        main(
+            [
+                "--model",
+                "fake/model",
+                "--results-dir",
+                str(tmp_path),
+                "--no-progress",
+            ]
+        )
+        == 1
+    )
+    error = capsys.readouterr().err
+    assert "Root cause: OSError: GPU worker exited" in error
+    assert "Checkpoint run ID: test-run-id" in error
 
 
 def test_dry_run_and_resume_are_mutually_exclusive(capsys):

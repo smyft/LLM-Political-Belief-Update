@@ -115,6 +115,10 @@ class BaseExperimentRunner:
         tensor_parallel_size: int = 1,
         dtype: str = "auto",
         enforce_eager: bool = False,
+        max_model_len: int | None = None,
+        max_num_seqs: int | None = None,
+        language_model_only: bool = False,
+        enable_thinking: bool | None = None,
         llm_factory: Callable[..., Any] = UnifiedLLMInterface,
         llm_interface: Any | None = None,
         show_progress: bool = True,
@@ -250,6 +254,43 @@ class BaseExperimentRunner:
             or tensor_parallel_size < 1
         ):
             raise ValueError("tensor_parallel_size must be a positive integer")
+        if not isinstance(dtype, str) or not dtype.strip():
+            raise ValueError("dtype must be a non-empty string")
+        if not isinstance(enforce_eager, bool):
+            raise TypeError("enforce_eager must be a boolean")
+        for name, integer_value in (
+            ("max_model_len", max_model_len),
+            ("max_num_seqs", max_num_seqs),
+        ):
+            if integer_value is not None and (
+                isinstance(integer_value, bool)
+                or not isinstance(integer_value, int)
+                or integer_value < 1
+            ):
+                raise ValueError(f"{name} must be a positive integer when provided")
+        if max_model_len is not None and max_model_len <= max_tokens:
+            raise ValueError(
+                "max_model_len must exceed max_tokens so the prompt has context space"
+            )
+        if not isinstance(language_model_only, bool):
+            raise TypeError("language_model_only must be a boolean")
+        if enable_thinking is not None and not isinstance(enable_thinking, bool):
+            raise TypeError("enable_thinking must be a boolean or None")
+        if use_api and (
+            float(gpu_memory_utilization) != 0.9
+            or tensor_parallel_size != 1
+            or dtype.strip() != "auto"
+            or enforce_eager
+            or max_model_len is not None
+            or max_num_seqs is not None
+            or language_model_only
+            or enable_thinking is not None
+        ):
+            raise ValueError(
+                "gpu_memory_utilization, tensor_parallel_size, dtype, enforce_eager, "
+                "max_model_len, max_num_seqs, language_model_only, and "
+                "enable_thinking apply only to local vLLM when non-default"
+            )
 
         self.model_name = model_name.strip()
         self.data_dir = (
@@ -301,8 +342,12 @@ class BaseExperimentRunner:
         self.api_retry_total_timeout = float(api_retry_total_timeout)
         self.gpu_memory_utilization = float(gpu_memory_utilization)
         self.tensor_parallel_size = tensor_parallel_size
-        self.dtype = dtype
+        self.dtype = dtype.strip()
         self.enforce_eager = enforce_eager
+        self.max_model_len = max_model_len
+        self.max_num_seqs = max_num_seqs
+        self.language_model_only = language_model_only
+        self.enable_thinking = enable_thinking
         self.show_progress = show_progress
 
         self.data_loader = DataLoader(data_dir=str(self.data_dir))
@@ -371,6 +416,10 @@ class BaseExperimentRunner:
                 tensor_parallel_size=self.tensor_parallel_size,
                 dtype=self.dtype,
                 enforce_eager=self.enforce_eager,
+                max_model_len=self.max_model_len,
+                max_num_seqs=self.max_num_seqs,
+                language_model_only=self.language_model_only,
+                enable_thinking=self.enable_thinking,
             )
         return self.llm_interface
 
@@ -596,6 +645,10 @@ class BaseExperimentRunner:
                 "tensor_parallel_size": self.tensor_parallel_size,
                 "dtype": self.dtype,
                 "enforce_eager": self.enforce_eager,
+                "max_model_len": self.max_model_len,
+                "max_num_seqs": self.max_num_seqs,
+                "language_model_only": self.language_model_only,
+                "enable_thinking": self.enable_thinking,
             },
             "max_base_units": max_base_units,
             **dict(self._extra_manifest_config()),
@@ -652,6 +705,14 @@ class BaseExperimentRunner:
         self.tensor_parallel_size = vllm_config["tensor_parallel_size"]
         self.dtype = vllm_config["dtype"]
         self.enforce_eager = vllm_config["enforce_eager"]
+        self.max_model_len = vllm_config.get("max_model_len")
+        self.max_num_seqs = vllm_config.get("max_num_seqs")
+        self.language_model_only = vllm_config.get("language_model_only", False)
+        self.enable_thinking = vllm_config.get("enable_thinking")
+        if self.max_model_len is not None and self.max_model_len <= self.max_tokens:
+            raise CheckpointValidationError(
+                "checkpoint max_model_len must exceed max_tokens"
+            )
         self._apply_extra_manifest_config(config)
 
     def _data_hashes(self) -> dict[str, str]:

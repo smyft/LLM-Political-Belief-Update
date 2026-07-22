@@ -89,14 +89,20 @@ Verbalize can use:
 - OpenRouter-compatible HTTP with `--use-api`; or
 - local vLLM when `--use-api` is omitted.
 
+Local vLLM verbalize runs disable chat-template thinking so the model cannot
+wrap the required standalone JSON object in a reasoning preamble. Hosted API
+reasoning behavior remains provider-managed.
+
 ### Logprob and the deliberate truncation
 
-The logprob pipeline uses local vLLM only. Each executable binary observation follows a two-phase protocol and generates at most two sequences:
+The logprob pipeline uses local vLLM only. It explicitly disables model chat-template thinking (`enable_thinking=False`) so Phase 1 contains only the requested visible analysis and Step 2 can satisfy its strict JSON contract. Phase 1 and Step 2 prompts bound the requested analysis to 100 words; `--max-tokens` remains the hard generation ceiling. Each executable binary observation follows a two-phase protocol and generates at most two sequences:
 
 1. generate visible analysis text without a final answer;
-2. continue the assistant message for exactly one token at scoring temperature `0.0`.
+2. close that assistant analysis turn, add a new user request for exactly `Yes` or `No`, and score the first token of the fresh assistant response at temperature `0.0`.
 
-Before the first executable chat, including a Step 2 chat, the runner initializes the backend and performs `preflight_continuation_scoring()` exactly once. A missing or incompatible continuation API, tokenizer, or model contract is a run-level fatal error: it is not converted into per-sample `ERROR` records and later chunks or stages do not continue. Planning-only operations and chunks with no executable assignments do not initialize the backend. Ordinary chat or continuation failures after a successful preflight retain the per-sample `ERROR` behavior.
+The Phase-2 dialogue is therefore `user analysis request → assistant visible analysis → user binary-answer request`; it does not reclassify visible analysis as hidden `reasoning_content` and does not continue an open assistant message. The manifest pins this versioned contract as `bounded_scoring_protocol=completed_analysis_new_user_fresh_assistant_v1`, so checkpoints created under older scoring dialogue layouts cannot be mixed with or resumed under this protocol.
+
+Before the first executable chat, including a Step 2 chat, the runner initializes the backend and performs `preflight_bounded_scoring()` exactly once. The preflight checks the vLLM API, tokenizer-specific Yes/No candidates, and chat-template boundaries for the completed analysis, new user request, fresh assistant generation prompt, and visible answer token. An incompatible API, tokenizer, model, or disabled-thinking contract is a run-level fatal error. A whole-batch local vLLM failure, including CUDA OOM, is also fatal: the current chunk is not published and its IDs remain missing. The run can be safely resumed after correcting the cause; a smaller operational `--chunk-size` may resolve batch-size or OOM failures, while a change to manifest-bound configuration requires a new run. Planning-only operations and chunks with no executable assignments do not initialize the backend. Once a backend returns an aligned batch, malformed individual response containers or score payloads remain auditable per-sample `ERROR` records.
 
 Before scoring, the tokenizer is used to discover a finite set of supported single-token spellings of Yes and No, including selected whitespace, case, and punctuation variants. Multi-token variants are excluded, and at most 128 token IDs are requested through vLLM's `logprob_token_ids` interface. The runner never requests the full vocabulary.
 
@@ -107,7 +113,7 @@ The reported `probabilities.Yes` and `probabilities.No` are therefore conditiona
 - the candidate token IDs and log probabilities;
 - `sampled_choice` and `format_valid`.
 
-After preflight, a missing candidate score or sampled token outside the Yes/No candidate set is `INVALID`; malformed response containers or inconsistent score fields are explicit `ERROR` records. The code never fills in `0.5/0.5`. Phase-1 `analysis_text` is visible model-generated text, not hidden chain-of-thought. Its `finish_reason` must be a string or null; `length` becomes `INVALID/phase1_truncated`, while a conservatively recognized explicit final Yes/No answer becomes `INVALID/phase1_contains_final_answer`. Neither case requests the continuation.
+After preflight, a missing candidate score or sampled token outside the Yes/No candidate set is `INVALID`; malformed response containers or inconsistent score fields are explicit `ERROR` records. The code never fills in `0.5/0.5`. Phase-1 `analysis_text` is visible model-generated text, not hidden chain-of-thought. Its `finish_reason` must be a string or null; `length` becomes `INVALID/phase1_truncated`, while a conservatively recognized explicit final Yes/No answer becomes `INVALID/phase1_contains_final_answer`. Neither case requests Phase-2 bounded scoring.
 
 ## Data
 
@@ -162,13 +168,25 @@ python -m pytest
 
 ### Local vLLM backend
 
-Install vLLM only in a compatible accelerator environment, preferably separate from the CPU/API environment:
+Install the runtime and vLLM accelerator supplement in a compatible accelerator environment, preferably separate from the CPU/API environment:
 
 ```bash
-python -m pip install -r requirements-vllm.txt
+python -m pip install -r requirements.txt -r requirements-vllm.txt
 ```
 
-The repository pins `vllm==0.24.0`. Follow the [official vLLM installation guide](https://docs.vllm.ai/en/stable/getting_started/installation/) for the correct platform-specific stack. Neither the logprob pipeline nor local verbalize inference is expected to work on an ordinary CPU-only environment.
+For GPU-backed repository development and offline tests, install both dependency layers in the same environment; `requirements-dev.txt` already includes `requirements.txt`:
+
+```bash
+python -m pip install -r requirements-vllm.txt -r requirements-dev.txt
+```
+
+The repository pins `vllm==0.24.0`. Follow the [version-matched vLLM 0.24 GPU installation guide](https://docs.vllm.ai/en/v0.24.0/getting_started/installation/gpu/) for the correct platform-specific stack. The local paths documented here target a compatible accelerator environment; a vLLM CPU build has not been validated for this repository.
+
+A Linux x86-64 compatibility check has passed with Python 3.11.15, `vllm==0.24.0`, a PyTorch 2.11.0 CUDA 13.0 build (`torch==2.11.0+cu130`), and an NVIDIA RTX PRO 6000 Blackwell GPU (compute capability 12.0, driver 580.82.09). In addition to dependency, import, CUDA, offline-test, and Ruff checks, original-BF16 Qwen3 and Qwen3.5 checkpoints completed real single-GPU engine initialization and backend-compatibility smoke checks. Current-protocol pipeline validation is specific to Qwen3.5: an original-BF16 Qwen3.5-9B checkpoint completed both a pilot and the default full plan under `completed_analysis_new_user_fresh_assistant_v1`. All 201,280 full-run records were `VALID`, with no missing, `INVALID`, or `ERROR` records, and an independent audit reproduced the manifest, assignments, checkpoint digests, final compilation, and derived indexes. The generated multi-gigabyte result and checkpoints remain outside the repository. This is validation on one host and one full-run model, not a multi-GPU or general performance guarantee.
+
+On that host, `flashinfer==0.6.12` misidentified Blackwell `sm_120` during sampler JIT warm-up. Setting `VLLM_USE_FLASHINFER_SAMPLER=0` selected vLLM's native sampler and allowed both model families to run; use this fallback only when the FlashInfer sampler fails on the installed CUDA/GPU combination.
+
+Model identifiers in the examples are illustrative. Select a local checkpoint from the required model family only after budgeting model weights (roughly two bytes per parameter for BF16), KV cache, CUDA graphs, scheduler concurrency, runtime overhead, download storage, and result storage against the actual host. A smaller official checkpoint is preferable when the larger one would leave inadequate safety margin; use a dry-run and a small `--max-base-units` pilot before any full plan.
 
 ## OpenRouter configuration and endpoint safety
 
@@ -214,7 +232,7 @@ python -m src.experiment.logprob_experiment_runner \
   --dry-run
 ```
 
-`--max-base-units` is a positive action-level budget applied before any Step 1 or Step 2 call. The selected subset is deterministic for the master `--seed`. Logical sample counts are exact for that plan. Backend sequence counts are conservative upper bounds: simulated-consensus cells or a logprob continuation can be skipped when prerequisite outputs are invalid. Use dry-run output, not intuition, to estimate maximum work.
+`--max-base-units` is a positive action-level budget applied before any Step 1 or Step 2 call. The selected subset is deterministic for the master `--seed`. Logical sample counts are exact for that plan. Backend sequence counts are conservative upper bounds: simulated-consensus cells or a Phase-2 bounded-score request can be skipped when prerequisite outputs are invalid. Use dry-run output, not intuition, to estimate maximum work.
 
 `--dry-run` and `--resume-from` are mutually exclusive in both CLIs. A dry-run always plans a new configuration and never silently ignores a resume request.
 
@@ -235,6 +253,9 @@ Local vLLM example:
 ```bash
 python -m src.experiment.verbalize_experiment_runner \
   --model Qwen/Qwen3-0.6B \
+  --max-tokens 256 \
+  --max-model-len 4096 \
+  --max-num-seqs 16 \
   --max-base-units 12 \
   --results-dir results
 ```
@@ -249,9 +270,9 @@ Important options include:
 - `--chunk-size N` for checkpoint shard size;
 - `--model-revision`, `--tokenizer-revision`, and `--code-revision` for reproducible local artifacts;
 - API retry/concurrency controls such as `--api-max-workers` and `--api-retry-total-timeout`;
-- local vLLM controls such as `--tensor-parallel-size`, `--gpu-memory-utilization`, and the explicit `--trust-remote-code` opt-in.
+- local vLLM controls such as `--tensor-parallel-size`, `--gpu-memory-utilization`, `--max-model-len`, `--max-num-seqs`, `--language-model-only`, and the explicit `--trust-remote-code` opt-in.
 
-These revision flags apply only to local vLLM and are rejected with `--use-api`; hosted versions must be selected through the provider's model identifier. For local models, when the same immutable revision applies to all three artifacts, `--model-revision` is sufficient: tokenizer and remote-code revisions default to it. Pass the two more specific flags when they differ. The logprob runner exposes the same revision controls.
+These revision and resource flags apply only to local vLLM and non-default local resource values are rejected with `--use-api`; hosted versions must be selected through the provider's model identifier. For local models, when the same immutable revision applies to all three artifacts, `--model-revision` is sufficient: tokenizer and remote-code revisions default to it. Pass the two more specific flags when they differ. The logprob runner exposes the same revision and resource controls. Add `--language-model-only` for text-only use of a multimodal Qwen3.5 checkpoint.
 
 Run `python -m src.experiment.verbalize_experiment_runner --help` for the authoritative CLI.
 
@@ -261,11 +282,14 @@ Run `python -m src.experiment.verbalize_experiment_runner --help` for the author
 python -m src.experiment.logprob_experiment_runner \
   --model Qwen/Qwen3-0.6B \
   --model-revision REVISION_OR_COMMIT \
+  --max-tokens 256 \
+  --max-model-len 4096 \
+  --max-num-seqs 16 \
   --max-base-units 12 \
   --results-dir results
 ```
 
-This command requires the pinned vLLM dependency and compatible GPU resources. It has the same selection, treatment, replicate, chunk, dry-run, and resume concepts as the verbalize runner. It uses `--no-simulated-consensus`, `--no-retest`, and `--no-placebo` to disable conditions. API mode is intentionally unavailable.
+This command requires the pinned vLLM dependency and compatible GPU resources. It has the same selection, treatment, replicate, chunk, dry-run, and resume concepts as the verbalize runner. It uses `--no-simulated-consensus`, `--no-retest`, and `--no-placebo` to disable conditions. API mode is intentionally unavailable. `--max-model-len` must exceed `--max-tokens`; use it to avoid reserving a model's full long-context capacity when the experiment needs much less. `--max-num-seqs` bounds scheduler concurrency. For a multimodal Qwen3.5 checkpoint used only with these text prompts, add `--language-model-only` to skip its vision tower.
 
 Run `python -m src.experiment.logprob_experiment_runner --help` for the authoritative CLI.
 
@@ -291,6 +315,8 @@ results/
 
 Experiment manifests and stage chunks currently use checkpoint schema version 2. Version 1 manifests/chunks are explicitly incompatible and must be preserved for audit rather than resumed as version 2. Every v2 shard stores `records_sha256`; loading and writing also perform stage- and pipeline-specific semantic validation of record metadata, statuses, and values rather than relying on a digest alone.
 
+Storage schema and measurement protocol are separate compatibility layers. Two runs can both use checkpoint schema v2 while remaining scientifically and operationally incompatible. In particular, a logprob run must contain the exact current `bounded_scoring_protocol`; a run created with an older open-assistant or `reasoning_content` layout must be preserved for audit and restarted under a new run ID, never upgraded by editing its manifest.
+
 Each stage's `.sample-index.sqlite3` is a disposable duplicate-ID index. The immutable JSON chunks remain the sole authority for records. On a cold open, or after any shard/index signature changes outside the current `CheckpointStore`, all existing shards are reread and validated, compared with SQLite, and used to rebuild a missing, stale, inconsistent, or damaged index. Within the same `CheckpointStore` instance, an unchanged warm authority cache uses file signatures plus compact index metadata to avoid rereading historical shard contents on each normal append; any mismatch falls back to the full JSON-authority scan. The index may be deleted safely when no writer is active.
 
 List compatible runs without loading a model:
@@ -314,9 +340,9 @@ python -m src.experiment.verbalize_experiment_runner \
   --resume-step step4a
 ```
 
-Both runners allow `--model` to be omitted with `--resume-from`; it remains required for a new run or dry-run. The stored manifest restores the model, backend, revisions, and experimental configuration, overriding newly supplied experimental flags. Restore must use a fresh runner whose backend has not already been initialized or injected; tests and embedding applications that need a custom backend must provide it through a lazy factory. Restore validates the pipeline, Git/source version, exact validated data snapshots and hashes, prompt hashes, configuration, exact sampling plan, expected sample IDs, reconstructed assignment metadata, record digests/semantics, and dependency DAG. Existing stage chunks are immutable and completed IDs are skipped.
+Both runners allow `--model` to be omitted with `--resume-from`; it remains required for a new run or dry-run. The stored manifest restores the model, backend, revisions, and experimental configuration, overriding newly supplied experimental flags. Restore must use a fresh runner whose backend has not already been initialized or injected; tests and embedding applications that need a custom backend must provide it through a lazy factory. Restore validates the pipeline, Git/source version, exact validated data snapshots and hashes, prompt hashes, configuration, exact scoring protocol, sampling plan, expected sample IDs, reconstructed assignment metadata, record digests/semantics, and dependency DAG. Existing stage chunks are immutable and completed IDs are skipped. Changing the scoring dialogue or protocol requires a fresh run; manually adding a new protocol field to an old manifest would both break its fingerprint and misdescribe how its logits were conditioned.
 
-An `ERROR` record is itself a completed immutable observation, so resume will not replace it. Start a new run to retry backend errors. See [CHECKPOINT_RESUME_GUIDE.md](CHECKPOINT_RESUME_GUIDE.md) for the full format and recovery rules.
+An already-published `ERROR` record is a completed immutable observation, so resume will not replace it; start a new run to retry that observation. In contrast, a logprob local-vLLM batch failure publishes no chunk and is explicitly resumable because those IDs remain missing. The fatal error message includes the checkpoint run ID. See [CHECKPOINT_RESUME_GUIDE.md](CHECKPOINT_RESUME_GUIDE.md) for the full format and recovery rules.
 
 ## Output and status semantics
 
@@ -335,6 +361,8 @@ Statuses mean:
 
 Invalid and error observations do not enter the denominator when simulated binary consensus is derived. A run with only `INVALID` observations can finish with a warning; a compiled run containing any `ERROR` observation returns a non-zero process status.
 
+For a binary record, `value.finish_reason` belongs to the one-token fresh-assistant scoring request. Because that request fixes `max_tokens=1`, `finish_reason=length` is normally expected there and is not evidence that Phase 1 was truncated; actual analysis truncation is recorded separately as `INVALID/phase1_truncated`.
+
 Compilation joins by stable sample ID and validates duplicate, unknown, missing, and wrong-stage records. Step 4a is inferred once per proposal unit and then referenced in the denormalized action-level output; it is not requested three times.
 
 ## Workload and resource warning
@@ -350,7 +378,7 @@ With all 40 persona conditions, 136 proposals, 408 actions, one replicate, and a
 | total verbalize backend sequences | 201,280 |
 | total logprob backend sequences | 397,120 |
 
-Logprob counts each two-phase binary measurement as up to two generated sequences. Invalid prerequisite output can reduce actual calls below these ceilings; replicates multiply the plan. Full runs can incur substantial API charges, GPU time, wall time, memory use, and checkpoint storage. Start with `--dry-run` and a very small `--max-base-units`; do not launch a full run merely to test installation.
+Logprob counts each two-phase binary measurement as up to two generated sequences. Invalid prerequisite output can reduce actual calls below these ceilings; replicates multiply the plan. Full runs can incur substantial API charges, GPU time, wall time, memory use, and checkpoint storage. A full fake-backend logprob run with only 16-character analyses already produced about 502 MB of checkpoint JSON and a 758 MB compiled JSON; real model text can require several GiB. The compiled action rows intentionally repeat proposal-level Step 1, Step 2, and Step 4a records, so downstream analysis must deduplicate those observations by `sample_id`. Start with `--dry-run` and a very small `--max-base-units`; do not launch a full run merely to test installation.
 
 ## Generate proposal-to-action data
 
@@ -394,7 +422,7 @@ The CPU-only suite covers strict parsing, data and prompt schemas, planning, lea
 python -m pytest -q
 ```
 
-The authoritative test count is the output of the current command and is intentionally not hard-coded here as the suite evolves. Bare `pytest -q` is also configured from the repository root, while CI uses `python -m pytest`. A wheel built from the source tree has been checked in an isolated Python 3.11 environment: it exposes the tracked prompts/data and generator module and completes installed-package dry-runs. No paid API request, real vLLM model load, CUDA/GPU run, or full experiment is part of that verification.
+The authoritative test count is the output of the current command and is intentionally not hard-coded here as the suite evolves. Bare `pytest -q` is also configured from the repository root, while CI uses `python -m pytest`. A wheel built from the source tree has been checked in an isolated Python 3.11 environment: it exposes the tracked prompts/data and generator module and completes installed-package dry-runs. The real single-GPU coverage described above includes one full Qwen3.5-9B logprob validation, but its bulk artifacts are not distributed with the repository. No paid API request or multi-GPU execution is part of the recorded compatibility check.
 
 ## Interpretation limits
 
@@ -404,6 +432,7 @@ Even with the engineering safeguards, important research limitations remain:
 - simulated consensus is endogenous to the same model and is not population-representative;
 - API providers and hosted models may drift during long runs;
 - comparing verbalize/API with logprob/vLLM can confound extraction method and backend;
+- cross-run comparisons must verify the same `bounded_scoring_protocol`, prompt/data hashes, and model/tokenizer revisions; matching `sample_id` values do not make observations from different scoring protocols interchangeable;
 - binary Yes/No outcomes compress uncertainty, neutrality, and refusal;
 - replicates are repeated model calls rather than independent respondents, and at deterministic temperature they may be identical;
 - repeated personas are not independent human respondents;

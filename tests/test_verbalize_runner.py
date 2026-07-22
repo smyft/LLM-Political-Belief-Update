@@ -23,6 +23,8 @@ from src.experiment.planning import (
 )
 from src.experiment.verbalize_experiment_runner import (
     VerbalizeExperimentRunner,
+    _runner_kwargs,
+    build_parser,
     main,
 )
 
@@ -32,9 +34,10 @@ PROMPTS_DIR = REPOSITORY_ROOT / "src" / "prompts" / "verbalize"
 
 
 class FakeLLM:
-    def __init__(self, *, invalid=False, fail_on=None):
+    def __init__(self, *, invalid=False, fail_on=None, enable_thinking=False):
         self.invalid = invalid
         self.fail_on = fail_on
+        self.enable_thinking = enable_thinking
         self.calls = []
 
     def chat(self, dialogue_history, **kwargs):
@@ -316,6 +319,85 @@ class VerbalizeRunnerTests(unittest.TestCase):
         self.assertEqual(plan["logical_sample_counts"]["step4b"], 3)
         self.assertEqual(factory_calls, [])
 
+    def test_backend_thinking_contract_and_resources_reach_lazy_factory(self):
+        local_calls = []
+
+        def local_factory(**kwargs):
+            local_calls.append(kwargs)
+            return FakeLLM()
+
+        local = self.runner(
+            None,
+            llm_factory=local_factory,
+            max_model_len=4096,
+            max_num_seqs=16,
+            language_model_only=True,
+        )
+        self.assertFalse(local.enable_thinking)
+        self.assertEqual(
+            local._extra_manifest_config(),
+            {"thinking_mode": "disabled_via_chat_template"},
+        )
+        local.initialize_llm()
+        self.assertEqual(len(local_calls), 1)
+        self.assertEqual(local_calls[0]["max_model_len"], 4096)
+        self.assertEqual(local_calls[0]["max_num_seqs"], 16)
+        self.assertTrue(local_calls[0]["language_model_only"])
+        self.assertFalse(local_calls[0]["enable_thinking"])
+
+        api_calls = []
+
+        def api_factory(**kwargs):
+            api_calls.append(kwargs)
+            return FakeLLM()
+
+        api = self.runner(None, llm_factory=api_factory, use_api=True)
+        self.assertIsNone(api.enable_thinking)
+        self.assertEqual(
+            api._extra_manifest_config(), {"thinking_mode": "provider_managed"}
+        )
+        api.initialize_llm()
+        self.assertEqual(len(api_calls), 1)
+        self.assertIsNone(api_calls[0]["enable_thinking"])
+
+        with self.assertRaisesRegex(
+            CheckpointValidationError, "thinking-mode contract"
+        ):
+            local._apply_extra_manifest_config({"thinking_mode": "provider_managed"})
+        with self.assertRaisesRegex(ValueError, "apply only to local vLLM"):
+            self.runner(FakeLLM(), use_api=True, max_model_len=4096)
+
+    def test_local_backend_must_explicitly_disable_thinking_before_chat(self):
+        for marker in (True, None):
+            with self.subTest(enable_thinking=marker):
+                backend = FakeLLM(enable_thinking=marker)
+                runner = self.runner(backend)
+                runner.load_prompt_templates()
+
+                with self.assertRaisesRegex(
+                    RuntimeError, "explicitly declare enable_thinking=False"
+                ):
+                    runner._execute_stage_chunk("step1", [stage_assignment("step1")])
+                self.assertEqual(backend.calls, [])
+
+    def test_cli_parses_local_vllm_resource_controls(self):
+        args = build_parser().parse_args(
+            [
+                "--model",
+                "fake/model",
+                "--max-model-len",
+                "4096",
+                "--max-num-seqs",
+                "16",
+                "--language-model-only",
+            ]
+        )
+        kwargs = _runner_kwargs(args)
+
+        self.assertEqual(kwargs["max_model_len"], 4096)
+        self.assertEqual(kwargs["max_num_seqs"], 16)
+        self.assertTrue(kwargs["language_model_only"])
+
     def test_data_change_after_planning_fails_before_manifest_or_model_call(self):
         fake = FakeLLM()
         runner = self.runner(
@@ -348,12 +430,32 @@ class VerbalizeRunnerTests(unittest.TestCase):
             include_retest=False,
             include_placebo=False,
             chunk_size=2,
+            max_model_len=4096,
+            max_num_seqs=16,
+            language_model_only=True,
         )
         output_path = runner.run_experiments(personas=["none"], max_base_units=3)
         payload = json.loads(output_path.read_text(encoding="utf-8"))
         self.assertEqual(
             payload["manifest"]["config"]["source_tree_sha256"],
             runner._source_tree_sha256(),
+        )
+        self.assertEqual(
+            payload["manifest"]["config"]["thinking_mode"],
+            "disabled_via_chat_template",
+        )
+        self.assertEqual(
+            payload["manifest"]["config"]["vllm"],
+            {
+                "gpu_memory_utilization": 0.9,
+                "tensor_parallel_size": 1,
+                "dtype": "auto",
+                "enforce_eager": False,
+                "max_model_len": 4096,
+                "max_num_seqs": 16,
+                "language_model_only": True,
+                "enable_thinking": False,
+            },
         )
         self.assertEqual(payload["status_summary"]["step4a"]["expected"], 1)
         self.assertEqual(payload["status_summary"]["step4b"]["expected"], 3)
@@ -377,6 +479,10 @@ class VerbalizeRunnerTests(unittest.TestCase):
         )
         self.assertTrue(resumed_output.is_file())
         self.assertFalse(resumed.has_execution_errors())
+        self.assertEqual(resumed.max_model_len, 4096)
+        self.assertEqual(resumed.max_num_seqs, 16)
+        self.assertTrue(resumed.language_model_only)
+        self.assertFalse(resumed.enable_thinking)
 
         step4a_dir = (
             self.results_dir / "checkpoints" / runner.active_manifest.run_id / "step4a"
@@ -517,10 +623,26 @@ class VerbalizeRunnerTests(unittest.TestCase):
             {"api_retry_base_delay": math.nan},
             {"api_retry_max_delay": math.inf},
             {"gpu_memory_utilization": True},
+            {"dtype": " "},
+            {"enforce_eager": 1},
         ):
             with self.subTest(kwargs=kwargs):
                 with self.assertRaises((TypeError, ValueError)):
                     self.runner(FakeLLM(), **kwargs)
+
+    def test_api_rejects_nondefault_local_vllm_controls(self):
+        for kwargs in (
+            {"gpu_memory_utilization": 0.5},
+            {"tensor_parallel_size": 2},
+            {"dtype": "half"},
+            {"enforce_eager": True},
+            {"max_model_len": 4096},
+            {"max_num_seqs": 16},
+            {"language_model_only": True},
+        ):
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaisesRegex(ValueError, "only to local vLLM"):
+                    self.runner(FakeLLM(), use_api=True, **kwargs)
 
     def test_cli_dry_run_uses_real_argv_without_initializing_model(self):
         stdout = io.StringIO()
@@ -544,6 +666,11 @@ class VerbalizeRunnerTests(unittest.TestCase):
                         "none",
                         "--max-base-units",
                         "1",
+                        "--max-model-len",
+                        "4096",
+                        "--max-num-seqs",
+                        "16",
+                        "--language-model-only",
                         "--dry-run",
                     ]
                 )

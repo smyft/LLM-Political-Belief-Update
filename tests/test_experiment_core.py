@@ -7,6 +7,7 @@ from src.experiment.core import (
     ExperimentRecord,
     ResultStatus,
     ValidationResult,
+    canonical_json,
     hash_files,
     hash_templates,
     make_record,
@@ -116,6 +117,18 @@ class StrictParsingTests(unittest.TestCase):
 
 
 class IdentityAndFingerprintTests(unittest.TestCase):
+    def test_canonical_json_recursively_rejects_non_string_mapping_keys(self):
+        cases = (
+            {1: "integer key", "1": "string key"},
+            {"outer": [{"nested": {1: "integer key"}}]},
+        )
+        for value in cases:
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "mapping keys must be strings"):
+                    canonical_json(value)
+
+        self.assertEqual(canonical_json({"one": 1}), '{"one":1}')
+
     def test_sample_id_is_order_independent_full_sha256(self):
         first = stable_sample_id("step1", {"persona": "a", "proposal": "p"})
         second = stable_sample_id("step1", {"proposal": "p", "persona": "a"})

@@ -14,11 +14,12 @@ What percentage of the U.S. population do you believe will answer "Yes" to the q
 Please provide your answer in JSON format with the following structure:
 ```json
 {
-    "analysis": "Your analysis of how different groups in the population might view this policy",
+    "analysis": "A concise analysis of how different groups might view this policy",
     "answer": 50
 }
 ```
 
 Set `answer` to one JSON number from 0 through 100 (decimals are allowed).
+Keep `analysis` to at most 100 words.
 
 Do not include any other content in your answer that does not conform to the JSON format above.

@@ -21,6 +21,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import sys
 import tempfile
 import time
@@ -45,6 +46,8 @@ PARTIAL_SCHEMA_VERSION = 2
 GENERATION_TEMPERATURE = 0.7
 GENERATION_SEED = 42
 GENERATION_MAX_TOKENS = 2000
+PROMPT_PLACEHOLDER_PATTERN = re.compile(r"\{([A-Z][A-Z0-9_]*)\}")
+REQUIRED_PROMPT_PLACEHOLDERS = frozenset({"POLICY_PROPOSAL"})
 
 
 class ProposalActionError(RuntimeError):
@@ -63,6 +66,10 @@ class _DuplicateJsonKey(ValueError):
     pass
 
 
+class _UnpairedUnicodeSurrogate(ValueError):
+    pass
+
+
 def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
@@ -74,6 +81,22 @@ def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 def _reject_json_constant(value: str) -> None:
     raise ValueError(f"non-standard JSON constant is not allowed: {value}")
+
+
+def _reject_unpaired_unicode_surrogates(value: Any, path: str = "$") -> None:
+    """Reject surrogate code points left after strict JSON decoding."""
+    if isinstance(value, str):
+        if any("\ud800" <= character <= "\udfff" for character in value):
+            raise _UnpairedUnicodeSurrogate(f"unpaired Unicode surrogate at {path}")
+        return
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            _reject_unpaired_unicode_surrogates(key, f"{path}.<key>")
+            _reject_unpaired_unicode_surrogates(child, f"{path}[{key!r}]")
+        return
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        for index, child in enumerate(value):
+            _reject_unpaired_unicode_surrogates(child, f"{path}[{index}]")
 
 
 def _positive_int(value: str) -> int:
@@ -148,11 +171,16 @@ def build_parser() -> argparse.ArgumentParser:
 def load_json_file(file_path: Path) -> Any:
     """Load UTF-8 JSON from ``file_path``."""
     with file_path.open("r", encoding="utf-8") as handle:
-        return json.load(
+        parsed = json.load(
             handle,
             object_pairs_hook=_unique_json_object,
             parse_constant=_reject_json_constant,
         )
+    try:
+        _reject_unpaired_unicode_surrogates(parsed)
+    except _UnpairedUnicodeSurrogate as exc:
+        raise ProposalActionError(f"JSON input contains an {exc}: {file_path}") from exc
+    return parsed
 
 
 def load_prompt_template(file_path: Path) -> str:
@@ -160,9 +188,18 @@ def load_prompt_template(file_path: Path) -> str:
     template = file_path.read_text(encoding="utf-8")
     if not template.strip():
         raise ProposalActionError(f"Prompt template is empty: {file_path}")
-    if "{POLICY_PROPOSAL}" not in template:
+    placeholders = frozenset(PROMPT_PLACEHOLDER_PATTERN.findall(template))
+    if placeholders != REQUIRED_PROMPT_PLACEHOLDERS:
+        missing = sorted(REQUIRED_PROMPT_PLACEHOLDERS - placeholders)
+        unknown = sorted(placeholders - REQUIRED_PROMPT_PLACEHOLDERS)
+        details = []
+        if missing:
+            details.append(f"missing: {', '.join(missing)}")
+        if unknown:
+            details.append(f"unknown: {', '.join(unknown)}")
         raise ProposalActionError(
-            f"Prompt template is missing {{POLICY_PROPOSAL}}: {file_path}"
+            "Prompt template placeholders must be exactly {POLICY_PROPOSAL} "
+            f"({'; '.join(details)}): {file_path}"
         )
     return template
 
@@ -219,6 +256,13 @@ def validate_action_result(data: Any, expected_proposal: str) -> dict[str, Any]:
     The schema is intentionally strict: no extra fields are accepted, all three
     action types must occur exactly once, and every description must be non-empty.
     """
+    try:
+        _reject_unpaired_unicode_surrogates(data)
+        _reject_unpaired_unicode_surrogates(expected_proposal, "expected_proposal")
+    except _UnpairedUnicodeSurrogate as exc:
+        raise ResponseValidationError(
+            f"The action response contains an {exc}."
+        ) from exc
     if not isinstance(expected_proposal, str) or not expected_proposal.strip():
         raise ResponseValidationError(
             "The expected proposal must be a non-empty string."
@@ -572,13 +616,30 @@ def ensure_output_safety(
     canonical_resolved = _resolved(CANONICAL_OUTPUT)
     policy_resolved = _resolved(policy_options_path)
     prompt_resolved = _resolved(prompt_template_path)
+    partial_resolved = _resolved(partial_path)
 
     if output_resolved in {policy_resolved, prompt_resolved}:
         raise ProposalActionError("Output must not replace an input or prompt file.")
+    if partial_resolved in {
+        output_resolved,
+        policy_resolved,
+        prompt_resolved,
+        canonical_resolved,
+    }:
+        raise ProposalActionError(
+            "Partial checkpoint must not replace an input, prompt, final output, "
+            "or tracked canonical data file."
+        )
     if output_path.is_symlink():
         raise ProposalActionError("Refusing to replace a symbolic-link output.")
     if partial_path.is_symlink():
         raise ProposalActionError("Refusing to use a symbolic-link partial checkpoint.")
+    if output_path.exists() and not output_path.is_file():
+        raise ProposalActionError("Output path must be a regular file when it exists.")
+    if partial_path.exists() and not partial_path.is_file():
+        raise ProposalActionError(
+            "Partial checkpoint path must be a regular file when it exists."
+        )
     if output_path.exists() and not overwrite:
         raise ProposalActionError(
             f"Output already exists; pass --overwrite to replace it: {output_path}"
@@ -715,6 +776,7 @@ def run_from_args(args: argparse.Namespace) -> dict[str, list[dict[str, Any]]]:
     api_base_url = resolve_openrouter_base_url()
 
     # Validate resume identity before constructing a potentially costly API client.
+    validated_partial: dict[str, Any] | None = None
     if args.resume:
         fingerprint = build_run_fingerprint(
             model=args.model,
@@ -723,12 +785,24 @@ def run_from_args(args: argparse.Namespace) -> dict[str, list[dict[str, Any]]]:
             plan=plan,
             api_base_url=api_base_url,
         )
-        validate_partial(
+        validated_partial = validate_partial(
             load_json_file(partial_path),
             fingerprint=fingerprint,
             model=args.model,
             plan=plan,
         )
+
+    # A crash may occur after the last partial checkpoint is committed but
+    # before final publication. Finishing that transaction is entirely offline;
+    # do not require credentials or initialize a paid API client.
+    if validated_partial is not None and len(validated_partial["completed"]) == len(
+        plan
+    ):
+        final_results = build_final_results(validated_partial["completed"], plan)
+        atomic_write_json(final_results, output_path)
+        partial_path.unlink(missing_ok=True)
+        _fsync_directory(partial_path.parent)
+        return final_results
 
     api_interface = create_api_interface(args.model, base_url=api_base_url)
     try:

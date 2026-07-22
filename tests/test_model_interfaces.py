@@ -9,7 +9,7 @@ import pytest
 import src.models.unified_llm_interface as unified_module
 import src.models.vllm_interface as vllm_module
 from src.models.unified_llm_interface import APIInterface, UnifiedLLMInterface
-from src.models.vllm_interface import VLLMInterface
+from src.models.vllm_interface import VLLMInterface, extract_thinking_process
 
 
 def completion_json(text, finish_reason="stop"):
@@ -21,6 +21,18 @@ def completion_json(text, finish_reason="stop"):
             }
         ]
     }
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("<think>reasoning</think>answer", "reasoning"),
+        ("<think>reasoning", "reasoning"),
+        ("reasoning</think>answer", "reasoning"),
+    ],
+)
+def test_extract_thinking_handles_both_full_and_template_prefilled_tags(text, expected):
+    assert extract_thinking_process(text) == expected
 
 
 class CountingTransport(httpx.BaseTransport):
@@ -360,6 +372,25 @@ class FakeTokenizer:
             return [22]
         return [100, 101]
 
+    def apply_chat_template(
+        self,
+        messages,
+        *,
+        tokenize,
+        add_generation_prompt,
+        continue_final_message,
+        **kwargs,
+    ):
+        assert tokenize is False
+        assert continue_final_message is False
+        del kwargs
+        rendered = "".join(
+            f"{message['role']}:{message['content']}\n" for message in messages
+        )
+        if add_generation_prompt:
+            rendered += "assistant:"
+        return rendered
+
 
 class FakeSamplingParams:
     def __init__(self, **kwargs):
@@ -391,6 +422,7 @@ class CompatibleFakeLLM:
         use_tqdm=True,
         add_generation_prompt=True,
         continue_final_message=False,
+        chat_template_kwargs=None,
     ):
         self.calls.append(
             {
@@ -399,6 +431,7 @@ class CompatibleFakeLLM:
                 "use_tqdm": use_tqdm,
                 "add_generation_prompt": add_generation_prompt,
                 "continue_final_message": continue_final_message,
+                "chat_template_kwargs": chat_template_kwargs,
             }
         )
         return self.outputs
@@ -438,6 +471,10 @@ def test_vllm_load_pins_model_tokenizer_and_code_revisions(monkeypatch):
         revision="model-commit",
         tokenizer_revision="tokenizer-commit",
         code_revision="code-commit",
+        max_model_len=4096,
+        max_num_seqs=16,
+        language_model_only=True,
+        enable_thinking=False,
     )
 
     interface.load_model()
@@ -447,10 +484,14 @@ def test_vllm_load_pins_model_tokenizer_and_code_revisions(monkeypatch):
     assert captured["tokenizer_revision"] == "tokenizer-commit"
     assert captured["code_revision"] == "code-commit"
     assert captured["trust_remote_code"] is False
+    assert captured["max_model_len"] == 4096
+    assert captured["max_num_seqs"] == 16
+    assert captured["language_model_only"] is True
 
 
-def test_continuation_requests_only_candidate_ids_and_first_token(monkeypatch):
+def test_fresh_turn_scoring_requests_only_candidate_ids_and_first_token(monkeypatch):
     interface = make_vllm_interface(monkeypatch)
+    interface.enable_thinking = False
     first_position = {
         11: SimpleNamespace(logprob=math.log(0.6), decoded_token=" Yes"),
         22: SimpleNamespace(logprob=math.log(0.2), decoded_token=" No"),
@@ -467,11 +508,12 @@ def test_continuation_requests_only_candidate_ids_and_first_token(monkeypatch):
     dialogue = [
         [
             {"role": "user", "content": "question"},
-            {"role": "assistant", "content": "analysis\nAnswer:"},
+            {"role": "assistant", "content": "analysis"},
+            {"role": "user", "content": "Answer exactly Yes or No."},
         ]
     ]
 
-    results = interface.chat_with_continuation(
+    results = interface.chat_with_bounded_candidates(
         dialogue,
         max_tokens=1,
         logprobs=20,  # legacy runner argument is accepted but not forwarded
@@ -485,8 +527,11 @@ def test_continuation_requests_only_candidate_ids_and_first_token(monkeypatch):
     assert "logprobs" not in sampling_kwargs
     assert "prompt_logprobs" not in sampling_kwargs
     assert call["use_tqdm"] is False
-    assert call["add_generation_prompt"] is False
-    assert call["continue_final_message"] is True
+    assert call["add_generation_prompt"] is True
+    assert call["continue_final_message"] is False
+    assert call["chat_template_kwargs"] == {"enable_thinking": False}
+    assert call["messages"] == dialogue
+    assert "enable_thinking" not in sampling_kwargs
     assert results[0]["valid"] is True
     assert results[0]["format_valid"] is True
     assert results[0]["sampled_choice"] == "Yes"
@@ -496,7 +541,20 @@ def test_continuation_requests_only_candidate_ids_and_first_token(monkeypatch):
     assert results[0]["logprobs_raw"] == results[0]["label_logprobs"]
 
 
-def test_continuation_preflight_loads_once_caches_and_never_infers(monkeypatch):
+def test_fresh_turn_scoring_requires_user_last_before_inference(monkeypatch):
+    interface = make_vllm_interface(monkeypatch)
+    interface.llm = CompatibleFakeLLM([])
+
+    with pytest.raises(ValueError, match="must end with a user message"):
+        interface.chat_with_bounded_candidates(
+            [[{"role": "assistant", "content": "analysis"}]],
+            show_progress=False,
+        )
+
+    assert interface.llm.calls == []
+
+
+def test_bounded_scoring_preflight_loads_once_caches_and_never_infers(monkeypatch):
     monkeypatch.setattr(vllm_module, "VLLM_AVAILABLE", True)
     events = {"loads": 0, "tokenizers": 0, "chat": 0, "generate": 0}
     sampling_calls = []
@@ -521,6 +579,7 @@ def test_continuation_preflight_loads_once_caches_and_never_infers(monkeypatch):
             use_tqdm=True,
             add_generation_prompt=True,
             continue_final_message=False,
+            chat_template_kwargs=None,
         ):
             del (
                 messages,
@@ -528,6 +587,7 @@ def test_continuation_preflight_loads_once_caches_and_never_infers(monkeypatch):
                 use_tqdm,
                 add_generation_prompt,
                 continue_final_message,
+                chat_template_kwargs,
             )
             events["chat"] += 1
             raise AssertionError("preflight must not call chat")
@@ -543,10 +603,10 @@ def test_continuation_preflight_loads_once_caches_and_never_infers(monkeypatch):
     )
     interface = VLLMInterface("fake/model")
 
-    first = interface.preflight_continuation_scoring()
+    first = interface.preflight_bounded_scoring()
     first[11] = "No"
     first[999] = "Yes"
-    second = interface.preflight_continuation_scoring()
+    second = interface.preflight_bounded_scoring()
     interface.load_model()
 
     assert second == {11: "Yes", 22: "No"}
@@ -560,7 +620,7 @@ def test_continuation_preflight_loads_once_caches_and_never_infers(monkeypatch):
     ]
 
 
-def test_continuation_preflight_rejects_incompatible_sampling_params(monkeypatch):
+def test_bounded_scoring_preflight_rejects_incompatible_sampling_params(monkeypatch):
     interface = make_vllm_interface(monkeypatch)
     interface.llm = CompatibleFakeLLM([])
 
@@ -571,26 +631,86 @@ def test_continuation_preflight_rejects_incompatible_sampling_params(monkeypatch
     monkeypatch.setattr(vllm_module, "SamplingParams", OldSamplingParams)
 
     with pytest.raises(RuntimeError, match="logprob_token_ids"):
-        interface.preflight_continuation_scoring()
+        interface.preflight_bounded_scoring()
     assert interface.llm.calls == []
 
 
-def test_unified_continuation_preflight_forwards_locally_and_rejects_api():
+def test_bounded_scoring_preflight_rejects_template_that_drops_analysis(monkeypatch):
+    interface = make_vllm_interface(monkeypatch)
+    interface.llm = CompatibleFakeLLM([])
+
+    class DroppingTokenizer(FakeTokenizer):
+        def apply_chat_template(self, messages, **kwargs):
+            del kwargs
+            return messages[-1]["content"]
+
+    interface.tokenizer = DroppingTokenizer()
+
+    with pytest.raises(RuntimeError, match="reconstruct phase-1 visible analysis"):
+        interface.preflight_bounded_scoring()
+    assert interface.llm.calls == []
+
+
+def test_bounded_scoring_preflight_requires_fresh_assistant_prefix(monkeypatch):
+    interface = make_vllm_interface(monkeypatch)
+    interface.llm = CompatibleFakeLLM([])
+
+    class NoFreshAssistantPrefixTokenizer(FakeTokenizer):
+        def apply_chat_template(
+            self,
+            messages,
+            *,
+            tokenize,
+            add_generation_prompt,
+            continue_final_message,
+            **kwargs,
+        ):
+            if len(messages) == 3:
+                add_generation_prompt = False
+            return super().apply_chat_template(
+                messages,
+                tokenize=tokenize,
+                add_generation_prompt=add_generation_prompt,
+                continue_final_message=continue_final_message,
+                **kwargs,
+            )
+
+    interface.tokenizer = NoFreshAssistantPrefixTokenizer()
+
+    with pytest.raises(RuntimeError, match="fresh assistant generation prompt"):
+        interface.preflight_bounded_scoring()
+    assert interface.llm.calls == []
+
+
+def test_vllm_dialogue_validates_optional_reasoning_content(monkeypatch):
+    interface = make_vllm_interface(monkeypatch)
+
+    with pytest.raises(TypeError, match="reasoning_content.*must be a string"):
+        interface._normalize_and_validate_dialogues(
+            [{"role": "assistant", "content": "Answer:", "reasoning_content": None}]
+        )
+    with pytest.raises(ValueError, match="only valid on assistant messages"):
+        interface._normalize_and_validate_dialogues(
+            [{"role": "user", "content": "question", "reasoning_content": "x"}]
+        )
+
+
+def test_unified_bounded_scoring_forwards_locally_and_rejects_api():
     local = object.__new__(UnifiedLLMInterface)
     local.use_api = False
     local.interface = SimpleNamespace(
-        preflight_continuation_scoring=lambda: {11: "Yes", 22: "No"}
+        preflight_bounded_scoring=lambda: {11: "Yes", 22: "No"}
     )
-    assert local.preflight_continuation_scoring() == {11: "Yes", 22: "No"}
+    assert local.preflight_bounded_scoring() == {11: "Yes", 22: "No"}
 
     api = object.__new__(UnifiedLLMInterface)
     api.use_api = True
     api.interface = object()
     with pytest.raises(NotImplementedError, match="only available with the vLLM"):
-        api.preflight_continuation_scoring()
+        api.preflight_bounded_scoring()
 
 
-def test_continuation_missing_candidate_is_explicitly_invalid(monkeypatch):
+def test_bounded_scoring_missing_candidate_is_explicitly_invalid(monkeypatch):
     interface = make_vllm_interface(monkeypatch)
     fake_llm = CompatibleFakeLLM(
         [
@@ -609,8 +729,8 @@ def test_continuation_missing_candidate_is_explicitly_invalid(monkeypatch):
     )
     interface.llm = fake_llm
 
-    result = interface.chat_with_continuation(
-        [[{"role": "assistant", "content": "Answer:"}]],
+    result = interface.chat_with_bounded_candidates(
+        [[{"role": "user", "content": "Answer exactly Yes or No."}]],
         show_progress=False,
     )[0]
 
@@ -620,7 +740,7 @@ def test_continuation_missing_candidate_is_explicitly_invalid(monkeypatch):
     assert result["logprobs_raw"] == {}
 
 
-def test_continuation_api_mismatch_fails_instead_of_falling_back(monkeypatch):
+def test_bounded_scoring_api_mismatch_fails_instead_of_falling_back(monkeypatch):
     interface = make_vllm_interface(monkeypatch)
 
     class OldLLM:
@@ -629,15 +749,42 @@ def test_continuation_api_mismatch_fails_instead_of_falling_back(monkeypatch):
 
     interface.llm = OldLLM()
 
-    with pytest.raises(RuntimeError, match="incompatible with continuation"):
-        interface.chat_with_continuation(
-            [[{"role": "assistant", "content": "Answer:"}]],
+    with pytest.raises(RuntimeError, match="incompatible with bounded scoring"):
+        interface.chat_with_bounded_candidates(
+            [[{"role": "user", "content": "Answer exactly Yes or No."}]],
             show_progress=False,
         )
 
 
+def test_bounded_scoring_preflight_requires_chat_template_kwargs(monkeypatch):
+    interface = make_vllm_interface(monkeypatch)
+
+    class LLMWithoutTemplateKwargs:
+        def chat(
+            self,
+            messages,
+            sampling_params=None,
+            use_tqdm=True,
+            add_generation_prompt=True,
+            continue_final_message=False,
+        ):
+            del (
+                messages,
+                sampling_params,
+                use_tqdm,
+                add_generation_prompt,
+                continue_final_message,
+            )
+
+    interface.llm = LLMWithoutTemplateKwargs()
+
+    with pytest.raises(RuntimeError, match="chat_template_kwargs"):
+        interface.preflight_bounded_scoring()
+
+
 def test_normal_vllm_chat_delegates_progress_to_engine(monkeypatch):
     interface = make_vllm_interface(monkeypatch)
+    interface.enable_thinking = False
     fake_llm = CompatibleFakeLLM(
         [FakeRequestOutput(FakeCompletion(logprobs=None, text="answer"))]
     )
@@ -650,6 +797,18 @@ def test_normal_vllm_chat_delegates_progress_to_engine(monkeypatch):
 
     assert result[0]["generated_text"] == "answer"
     assert fake_llm.calls[0]["use_tqdm"] is False
+    assert fake_llm.calls[0]["add_generation_prompt"] is True
+    assert fake_llm.calls[0]["continue_final_message"] is False
+    assert fake_llm.calls[0]["chat_template_kwargs"] == {"enable_thinking": False}
+    assert "logprob_token_ids" not in fake_llm.calls[0]["sampling_params"].kwargs
+    assert "enable_thinking" not in fake_llm.calls[0]["sampling_params"].kwargs
+
+
+def test_unified_interface_rejects_unknown_arguments_before_backend_creation():
+    with pytest.raises(
+        TypeError, match="unsupported model-interface.*max_model_lenght"
+    ):
+        UnifiedLLMInterface("fake/model", max_model_lenght=4096)
 
 
 def test_vllm_cleanup_detaches_owner_reference_before_release(monkeypatch):

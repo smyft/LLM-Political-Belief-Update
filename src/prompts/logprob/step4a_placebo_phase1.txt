@@ -12,4 +12,4 @@ Please provide your own assessment after reading this neutral contextual stateme
 Do you believe this policy will be beneficial to the United States?
 
 ## Response Format
-Provide a concise analysis only. Do not state a final Yes/No answer.
+Provide a concise analysis of at most 100 words. Do not state a final Yes/No answer.

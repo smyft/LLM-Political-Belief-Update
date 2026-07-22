@@ -13,4 +13,4 @@ Will you support the following action?
 **Action:** {CORRESPONDING_ACTION}
 
 ## Response Format
-Provide a concise analysis only. Do not state a final Yes/No answer.
+Provide a concise analysis of at most 100 words. Do not state a final Yes/No answer.

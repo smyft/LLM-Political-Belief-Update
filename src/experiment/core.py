@@ -326,10 +326,32 @@ def parse_percentage_response(response_text: str) -> ValidationResult:
     )
 
 
+def _validate_canonical_mapping_keys(value: Any, path: str = "$") -> None:
+    """Require string keys throughout values used for canonical JSON."""
+
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValueError(
+                    f"mapping keys must be strings at {path}; got {type(key).__name__}"
+                )
+            _validate_canonical_mapping_keys(item, f"{path}[{key!r}]")
+        return
+    if isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            _validate_canonical_mapping_keys(item, f"{path}[{index}]")
+
+
 def canonical_json(value: Any) -> str:
-    """Return deterministic JSON used by IDs and fingerprints."""
+    """Return deterministic JSON used by IDs and fingerprints.
+
+    Mapping keys must be strings at every nesting level. Python's JSON encoder
+    otherwise coerces integer-like keys to strings, which could give distinct
+    input mappings the same fingerprint.
+    """
 
     try:
+        _validate_canonical_mapping_keys(value)
         return json.dumps(
             value,
             ensure_ascii=False,

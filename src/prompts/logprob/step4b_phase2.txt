@@ -1,3 +1,1 @@
-{ANALYSIS_TEXT}
-
-Based on my analysis above, my final answer to whether I will support this action is (answer with Yes or No only):
+Based on your analysis above, answer whether you will support this action. Respond with exactly Yes or No only; do not use Markdown, quotes, or punctuation.

@@ -51,6 +51,25 @@ def _reject_json_constant(value: str) -> None:
     raise ValueError(f"non-standard JSON constant is not allowed: {value}")
 
 
+def _validate_json_unicode_scalars(value: Any, source: Path, path: str = "$") -> None:
+    """Reject escaped, unpaired UTF-16 surrogates after JSON decoding."""
+
+    if isinstance(value, str):
+        if any("\ud800" <= character <= "\udfff" for character in value):
+            raise ValueError(
+                f"{source}: JSON string at {path} contains an unpaired UTF-16 surrogate"
+            )
+        return
+    if isinstance(value, dict):
+        for index, (key, item) in enumerate(value.items()):
+            _validate_json_unicode_scalars(key, source, f"{path} object key #{index}")
+            _validate_json_unicode_scalars(item, source, f"{path}[{key!r}]")
+        return
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            _validate_json_unicode_scalars(item, source, f"{path}[{index}]")
+
+
 def _load_strict_json_snapshot(path: Path) -> tuple[Any, str]:
     """Read, parse, and hash one exact byte snapshot of a JSON file."""
 
@@ -60,6 +79,7 @@ def _load_strict_json_snapshot(path: Path) -> tuple[Any, str]:
         object_pairs_hook=_strict_object_pairs,
         parse_constant=_reject_json_constant,
     )
+    _validate_json_unicode_scalars(data, path)
     return data, hashlib.sha256(raw).hexdigest()
 
 
@@ -223,6 +243,10 @@ class DataLoader:
             for value in values:
                 if not isinstance(value, str) or not value.strip():
                     raise ValueError(f"{source}: every {field} entry must be non-empty")
+                if value == "none":
+                    raise ValueError(
+                        f"{source}: persona label 'none' is reserved for the no-persona control"
+                    )
                 labels.append(value)
         if len(labels) != len(set(labels)):
             raise ValueError(f"{source} contains duplicate entity labels")

@@ -56,12 +56,12 @@ logprob-20260720T123456.123456Z-a1b2c3d4
 
 ## 4. Manifest 固定了什么
 
-`manifest.json` 与 stage chunks 的 checkpoint schema version 当前为 `2`。Version 1 与 version 2 明确不兼容：旧运行应保留作审计，不能由当前 loader 直接恢复或静默升级。主要字段包括：
+`manifest.json` 与 stage chunks 的 checkpoint schema version 当前为 `2`。Version 1 与 version 2 明确不兼容：旧运行应保留作审计，不能由当前 loader 直接恢复或静默升级。存储 schema 与 measurement protocol 是两层独立契约；两个 run 即使同为 v2，也可能因为 scoring dialogue/protocol 不同而不能恢复或比较。主要字段包括：
 
 | 字段 | 含义 |
 | --- | --- |
 | `run_id`, `pipeline`, `created_at` | 运行身份 |
-| `config` | 模型、backend、temperature、max tokens、seed、replicates、treatment 开关、固定百分比、API/vLLM 参数、model/tokenizer/remote-code revisions、源码树哈希等 |
+| `config` | 模型、backend、temperature、max tokens、seed、replicates、treatment 开关、固定百分比、API/vLLM 参数、model/tokenizer/remote-code revisions、源码树哈希，以及 logprob 的 `binary_estimator`、`scoring_temperature`、`thinking_mode`、`bounded_scoring_protocol` 等 |
 | `config_fingerprint` | `config` 的内容哈希 |
 | `data_hashes`, `data_fingerprint` | `entities.json` 与 `proposal_actions.json` 的内容哈希 |
 | `prompt_hashes`, `prompt_fingerprint` | 该 pipeline 全部必需 prompt 的内容哈希 |
@@ -150,7 +150,7 @@ python -m src.experiment.verbalize_experiment_runner \
   --dry-run
 ```
 
-dry-run 的 logical sample counts 是计划中的精确数量；backend sequence counts 是保守上界。若前序输出无效，simulated-consensus cell 或 logprob continuation 可能不调用 backend，因此实际请求数可以更少。
+dry-run 的 logical sample counts 是计划中的精确数量；backend sequence counts 是保守上界。若前序输出无效，simulated-consensus cell 或 logprob Phase-2 bounded scoring 可能不调用 backend，因此实际请求数可以更少。
 
 两个 CLI 都把 `--dry-run` 与 `--resume-from` 定义为显式互斥；不能用 dry-run 静默忽略一个恢复请求。
 
@@ -170,11 +170,18 @@ logprob 示例：
 python -m src.experiment.logprob_experiment_runner \
   --model Qwen/Qwen3-0.6B \
   --model-revision REVISION_OR_COMMIT \
+  --max-tokens 256 \
+  --max-model-len 4096 \
+  --max-num-seqs 16 \
   --max-base-units 12 \
   --results-dir results
 ```
 
-logprob runner 在第一个可执行 chat（包括 Step 2）之前初始化 backend 并只运行一次 `preflight_continuation_scoring()`。continuation/tokenizer/API 不兼容是 run-level fatal：不会转成每样本 `ERROR`，也不会继续后续 chunk/stage；没有可执行 assignment 时不会初始化。preflight 成功后的普通 chat/continuation 运行异常仍按样本记录 `ERROR`。phase 1 的 `finish_reason=length` 记为 `INVALID/phase1_truncated`，保守识别到显式最终 Yes/No 时记为 `INVALID/phase1_contains_final_answer`，两者都不发起 continuation。
+logprob runner 显式关闭 chat-template thinking。每个 binary observation 先生成并关闭一个可见 assistant analysis turn，再追加新的 user 指令，最后只评分新 assistant 回答的首 token；它不使用 `reasoning_content`，也不继续一个尚未关闭的 assistant message。manifest 通过 `bounded_scoring_protocol=completed_analysis_new_user_fresh_assistant_v1` 固定这套协议，旧 dialogue/scoring 协议的 checkpoint 不能混用或恢复。
+
+runner 在第一个可执行 chat（包括 Step 2）之前初始化 backend、只运行一次 `preflight_bounded_scoring()`。bounded-scoring/tokenizer/API/disabled-thinking contract 不兼容是 run-level fatal。普通 chat 或 bounded scoring 的整批本地 vLLM 异常（包括 OOM）同样是 fatal：当前 chunk 不发布，ID 保持缺失。修正原因后可以安全恢复；较小的 `--chunk-size` 可能解决 batch-size/OOM，但若必须改变 manifest-bound 配置则应新建 run。终端错误会打印 run ID。backend 已返回对齐 batch 后，单条 response schema 错误仍记录为不可变 `ERROR`。没有可执行 assignment 时不会初始化。phase 1 的 `finish_reason=length` 记为 `INVALID/phase1_truncated`，Step 2 对应记为 `INVALID/step2_truncated`；phase 1 保守识别到显式最终 Yes/No 时记为 `INVALID/phase1_contains_final_answer`，这些样本都不会进入后续 bounded scoring/解析。
+
+本地 vLLM verbalize 同样固定 `enable_thinking=False`，避免 reasoning 前后缀破坏 standalone JSON；API verbalize 的 reasoning 行为由 provider 管理。两个本地 runner 都把 `max_model_len`、`max_num_seqs`、`language_model_only` 和 thinking contract 固定进 manifest，恢复时不能通过命令行改写。
 
 这些 revision flags 只适用于 local vLLM，与 `--use-api` 同用会被拒绝；hosted API 版本必须通过 provider model identifier 选择。如果 local model、tokenizer 与 remote code 使用同一个不可变 revision，只传 `--model-revision` 即可；`--tokenizer-revision` 和 `--code-revision` 默认继承它。三者不同时应分别指定。启用 `--trust-remote-code` 时必须至少通过 `--code-revision` 或 `--model-revision` 固定所执行的代码，否则 runner 会拒绝启动。
 
@@ -263,7 +270,7 @@ python -m src.experiment.logprob_experiment_runner \
 3. pipeline 必须与所用 runner 一致；
 4. 当前 Git/source version 必须与 manifest 一致；
 5. 当前数据文件的精确已验证 byte snapshots、对应哈希与 prompt 内容哈希必须一致；
-6. 选择计划、treatment 设计和所有 expected sample IDs 必须可精确重建；
+6. scoring dialogue/protocol、选择计划、treatment 设计和所有 expected sample IDs 必须可精确重建；
 7. 所有前置 stage 必须完整；
 8. 所有 chunk 必须属于同一 run、fingerprint 和 stage，`records_sha256` 必须匹配；
 9. 已保存 record 的 metadata 必须与当前重建 assignment 精确一致，status/value 还要通过 pipeline/stage 语义验证；
@@ -278,19 +285,20 @@ DataLoader 从同一份 bytes 完成解析、严格验证与 SHA-256，只有全
 - 修改 prompt；
 - 修改 `entities.json` 或 `proposal_actions.json`；
 - 改模型、backend、model/tokenizer/remote-code revision、temperature、seed、replicates、固定百分比或 treatment 开关；
+- 改 binary scoring dialogue、thinking mode 或 `bounded_scoring_protocol`；
 - 手工修改 manifest、sample IDs 或 chunk。
 
-这些情况应创建新 run。不要通过编辑 manifest 绕过检查；那会破坏可复现性，并会被 fingerprint 验证拒绝。
+这些情况应创建新 run。旧 assistant-content continuation 或 `assistant_reasoning_content` checkpoint 不能由当前 fresh-assistant 协议恢复。不要通过编辑 manifest 补字段或绕过检查；那会破坏 fingerprint，并错误描述旧 run 实际使用的条件上下文。
 
 ## 12. `VALID`、`INVALID` 与 `ERROR` 对恢复的影响
 
 - `VALID`：测量契约通过；
 - `INVALID`：样本存在，但回答或 treatment 条件不满足测量契约；不会填成 Yes/No/50%；
-- `ERROR`：backend、transport、response container 或执行路径失败。
+- `ERROR`：已取得可归属到单个 sample 的 response container 或执行路径失败。
 
 三种状态都是已保存 record，因此都属于“该 `sample_id` 已完成”。恢复只补缺失 ID，不会覆盖 `INVALID` 或 `ERROR`。
 
-这条规则尤其重要：**如果 chunk 中已有 `ERROR`，必须创建新 run 才能重试该观测。** 直接再次 `--resume-from` 会跳过它。两个 CLI 在最终结果包含 `ERROR` 时返回非零状态，并明确提示新建 run。
+这条规则尤其重要：**如果已发布 chunk 中已有 `ERROR`，必须创建新 run 才能重试该观测。** 直接再次 `--resume-from` 会跳过它。两个 CLI 在最终结果包含 `ERROR` 时返回非零状态，并明确提示新建 run。logprob 的整批 vLLM 异常不会发布这种 `ERROR` chunk，因此是“缺失 ID”场景，可以恢复。
 
 `INVALID` 可以是有效的实验观测，例如模型输出不符合回答格式；它应进入缺失/拒答分析，而不是自动重试到得到 Yes/No 为止。
 
@@ -353,6 +361,10 @@ Step 4a 是 proposal-level 推理，编译到 action-level 输出时会在匹配
 
 数据、prompt、配置、计划或预期 ID 已变化。不要修改 manifest；创建新 run。
 
+### `checkpoint has an incompatible bounded-scoring protocol`
+
+该 logprob run 缺少当前协议字段，或由旧 scoring dialogue 创建。保留旧 run 作审计，并使用当前代码新建 run；不要手工给旧 manifest 补上协议字段。
+
 ### `checkpoint is missing sample ID`
 
 选择的 `--resume-step` 太晚，前置 stage 还不完整。根据 `--list-checkpoints` 从最早不完整 stage 恢复。
@@ -374,4 +386,5 @@ checkpoint 可能被手工修改、复制或混合。保留现场做审计，不
 5. 不编辑 manifest 或 JSON chunk；备份整个 `checkpoints/<run_id>/`。`.sample-index.sqlite3` 只是可重建缓存，不必作为权威数据保存。
 6. 把 `INVALID` 和 `ERROR` 作为不同状态分析。
 7. 真实 API/GPU 全量实验前先用 fake backend/小模型验证流程。
-8. 若要改变 treatment、prompt、数据或模型，创建新 run，而不是复用旧 ID。
+8. 若要改变 treatment、prompt、数据、模型或 scoring protocol，创建新 run，而不是复用旧 ID。
+9. 比较 logprob runs 前核对完全相同的 `bounded_scoring_protocol`、prompt/data hashes 与 model/tokenizer revisions；相同 `sample_id` 不能覆盖协议差异。

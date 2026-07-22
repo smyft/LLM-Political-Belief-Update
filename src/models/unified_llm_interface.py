@@ -385,11 +385,25 @@ class UnifiedLLMInterface:
         "code_revision",
         "dtype",
         "enforce_eager",
+        "max_model_len",
+        "max_num_seqs",
+        "language_model_only",
+        "enable_thinking",
     }
 
     def __init__(self, model_name: str, use_api: bool = False, **kwargs: Any) -> None:
         self.use_api = use_api
         self.model_name = model_name
+        # Expose the configured template contract so experiment runners can
+        # verify injected/factory-created backends before making model calls.
+        self.enable_thinking = kwargs.get("enable_thinking")
+
+        unknown_kwargs = set(kwargs).difference(self._API_KWARGS | self._VLLM_KWARGS)
+        if unknown_kwargs:
+            raise TypeError(
+                "unsupported model-interface argument(s): "
+                + ", ".join(sorted(unknown_kwargs))
+            )
 
         if use_api:
             api_kwargs = {
@@ -422,7 +436,7 @@ class UnifiedLLMInterface:
             **kwargs,
         )
 
-    def chat_with_continuation(
+    def chat_with_bounded_candidates(
         self,
         dialogue_history: DialogueInput,
         show_progress: bool = True,
@@ -431,23 +445,23 @@ class UnifiedLLMInterface:
     ) -> list[dict[str, Any]]:
         if self.use_api:
             raise NotImplementedError(
-                "chat_with_continuation is only available with the vLLM backend"
+                "chat_with_bounded_candidates is only available with the vLLM backend"
             )
-        return self.interface.chat_with_continuation(
+        return self.interface.chat_with_bounded_candidates(
             dialogue_history,
             show_progress=show_progress,
             desc=desc,
             **kwargs,
         )
 
-    def preflight_continuation_scoring(self) -> dict[int, str]:
-        """Validate local bounded continuation scoring without inference."""
+    def preflight_bounded_scoring(self) -> dict[int, str]:
+        """Validate local bounded first-token scoring without inference."""
 
         if self.use_api:
             raise NotImplementedError(
-                "preflight_continuation_scoring is only available with the vLLM backend"
+                "preflight_bounded_scoring is only available with the vLLM backend"
             )
-        return self.interface.preflight_continuation_scoring()
+        return self.interface.preflight_bounded_scoring()
 
     def extract_thinking(self, response_text: str) -> str:
         if self.use_api:

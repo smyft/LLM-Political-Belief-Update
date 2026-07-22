@@ -97,6 +97,49 @@ def test_output_is_required_without_initializing_api(monkeypatch):
     assert exc_info.value.code == 2
 
 
+@pytest.mark.parametrize(
+    ("template", "message"),
+    [
+        ("Create actions without a placeholder", "missing: POLICY_PROPOSAL"),
+        (
+            "Create {POLICY_PROPOSAL} with {UNKNOWN_CONTEXT}",
+            "unknown: UNKNOWN_CONTEXT",
+        ),
+        ("Create actions from {UNKNOWN_CONTEXT}", "missing: POLICY_PROPOSAL"),
+    ],
+)
+def test_prompt_template_requires_exact_uppercase_placeholder_set(
+    tmp_path, template, message
+):
+    prompt_path = tmp_path / "prompt.txt"
+    prompt_path.write_text(template, encoding="utf-8")
+
+    with pytest.raises(p2a.ProposalActionError, match=message):
+        p2a.load_prompt_template(prompt_path)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        r'{"\ud800": "value"}',
+        r'{"outer": ["\udfff"]}',
+    ],
+)
+def test_json_input_rejects_unpaired_surrogates_in_keys_and_values(tmp_path, payload):
+    input_path = tmp_path / "input.json"
+    input_path.write_text(payload, encoding="utf-8")
+
+    with pytest.raises(p2a.ProposalActionError, match="unpaired Unicode surrogate"):
+        p2a.load_json_file(input_path)
+
+
+def test_json_input_accepts_valid_surrogate_pair(tmp_path):
+    input_path = tmp_path / "input.json"
+    input_path.write_text(r'{"emoji": "\ud83d\ude00"}', encoding="utf-8")
+
+    assert p2a.load_json_file(input_path) == {"emoji": chr(0x1F600)}
+
+
 @pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
 def test_delay_must_be_finite(value):
     with pytest.raises(SystemExit) as exc_info:
@@ -177,6 +220,18 @@ def test_parser_rejects_markdown_wrapped_json():
 def test_parser_rejects_duplicate_keys_and_nonstandard_constants(response):
     with pytest.raises(p2a.ResponseValidationError):
         p2a.parse_llm_response(response, "Proposal")
+
+
+@pytest.mark.parametrize("location", ["key", "value"])
+def test_action_response_rejects_unpaired_surrogates_recursively(location):
+    response = valid_result("Proposal")
+    if location == "key":
+        response["actions"][0]["\ud800"] = "invalid key"
+    else:
+        response["actions"][0]["action_description"] = "invalid \udfff value"
+
+    with pytest.raises(p2a.ResponseValidationError, match="unpaired Unicode surrogate"):
+        p2a.parse_llm_response(json.dumps(response), "Proposal")
 
 
 def test_failure_keeps_only_valid_partial_and_never_publishes_final(
@@ -300,6 +355,85 @@ def test_existing_output_requires_explicit_overwrite(tmp_path, monkeypatch):
 
     assert p2a.main(cli_args(policy_path, prompt_path, output)) != 0
     assert json.loads(output.read_text(encoding="utf-8")) == {"existing": True}
+
+
+def test_partial_checkpoint_cannot_alias_policy_input(tmp_path, monkeypatch):
+    output = tmp_path / "generated.json"
+    policy_path = p2a.partial_path_for(output)
+    prompt_path = tmp_path / "prompt.txt"
+    original_policy = {"Only": ["One"]}
+    policy_path.write_text(json.dumps(original_policy), encoding="utf-8")
+    prompt_path.write_text(PROMPT, encoding="utf-8")
+    monkeypatch.setattr(
+        p2a,
+        "create_api_interface",
+        lambda model, **kwargs: pytest.fail(
+            "API must not initialize for a destructive partial-path collision"
+        ),
+    )
+
+    assert p2a.main(cli_args(policy_path, prompt_path, output, "--overwrite")) != 0
+    assert json.loads(policy_path.read_text(encoding="utf-8")) == original_policy
+    assert not output.exists()
+
+
+def test_existing_output_directory_is_rejected_before_api_initialization(
+    tmp_path, monkeypatch
+):
+    policy_path, prompt_path = write_inputs(tmp_path, {"Only": ["One"]})
+    output = tmp_path / "generated.json"
+    output.mkdir()
+    monkeypatch.setattr(
+        p2a,
+        "create_api_interface",
+        lambda model, **kwargs: pytest.fail(
+            "API must not initialize for a directory output"
+        ),
+    )
+
+    assert p2a.main(cli_args(policy_path, prompt_path, output, "--overwrite")) != 0
+    assert output.is_dir()
+    assert not p2a.partial_path_for(output).exists()
+
+
+def test_fully_complete_partial_publishes_without_api_initialization(
+    tmp_path, monkeypatch
+):
+    policy_options = {"Only": ["One"]}
+    policy_path, prompt_path = write_inputs(tmp_path, policy_options)
+    output = tmp_path / "generated.json"
+    plan = p2a.build_plan(policy_options)
+    monkeypatch.setenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+    fingerprint = p2a.build_run_fingerprint(
+        model="test/model",
+        policy_options=policy_options,
+        prompt_template=PROMPT,
+        plan=plan,
+        api_base_url="https://openrouter.ai/api/v1",
+    )
+    partial_path = p2a.partial_path_for(output)
+    p2a.atomic_write_json(
+        {
+            "schema_version": p2a.PARTIAL_SCHEMA_VERSION,
+            "run_fingerprint": fingerprint,
+            "model": "test/model",
+            "completed": [{"category": "Only", "result": valid_result("One")}],
+        },
+        partial_path,
+    )
+    monkeypatch.setattr(
+        p2a,
+        "create_api_interface",
+        lambda model, **kwargs: pytest.fail(
+            "API must not initialize to publish a fully complete partial"
+        ),
+    )
+
+    assert p2a.main(cli_args(policy_path, prompt_path, output, "--resume")) == 0
+    assert json.loads(output.read_text(encoding="utf-8")) == {
+        "Only": [valid_result("One")]
+    }
+    assert not partial_path.exists()
 
 
 def test_output_and_partial_symlinks_are_rejected_before_api_initialization(

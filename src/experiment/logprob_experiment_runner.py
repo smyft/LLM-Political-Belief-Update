@@ -3,8 +3,9 @@
 Every binary stage uses a deliberately bounded, two-phase estimator:
 
 1. generate a concise analysis without a final answer; and
-2. continue an assistant message for exactly one token while requesting only a
-   finite tokenizer-specific set of single-token Yes/No variants.
+2. close that analysis turn, ask for an exact Yes/No in a new user turn, and
+   score exactly the first token of the fresh assistant response over a finite
+   tokenizer-specific set of single-token Yes/No variants.
 
 The resulting Yes/No probabilities are conditional on that finite candidate
 set.  ``candidate_mass`` and ``residual_mass`` are persisted with every valid
@@ -108,7 +109,7 @@ class LogprobExperimentRunner(BaseExperimentRunner):
             "step1_phase1.txt",
             frozenset({"PERSONA_INJECTION", "POLICY_PROPOSAL"}),
         ),
-        "step1_phase2": ("step1_phase2.txt", frozenset({"ANALYSIS_TEXT"})),
+        "step1_phase2": ("step1_phase2.txt", frozenset()),
         "step2": (
             "step2.txt",
             frozenset({"PERSONA_INJECTION", "POLICY_PROPOSAL"}),
@@ -117,12 +118,12 @@ class LogprobExperimentRunner(BaseExperimentRunner):
             "step3_phase1.txt",
             frozenset({"PERSONA_INJECTION", "POLICY_PROPOSAL", "CORRESPONDING_ACTION"}),
         ),
-        "step3_phase2": ("step3_phase2.txt", frozenset({"ANALYSIS_TEXT"})),
+        "step3_phase2": ("step3_phase2.txt", frozenset()),
         "step4a_phase1": (
             "step4a_phase1.txt",
             frozenset({"PERSONA_INJECTION", "POLICY_PROPOSAL", "DISTRIBUTION"}),
         ),
-        "step4a_phase2": ("step4a_phase2.txt", frozenset({"ANALYSIS_TEXT"})),
+        "step4a_phase2": ("step4a_phase2.txt", frozenset()),
         "step4a_placebo_phase1": (
             "step4a_placebo_phase1.txt",
             frozenset({"PERSONA_INJECTION", "POLICY_PROPOSAL"}),
@@ -138,7 +139,7 @@ class LogprobExperimentRunner(BaseExperimentRunner):
                 }
             ),
         ),
-        "step4b_phase2": ("step4b_phase2.txt", frozenset({"ANALYSIS_TEXT"})),
+        "step4b_phase2": ("step4b_phase2.txt", frozenset()),
         "step4b_placebo_phase1": (
             "step4b_placebo_phase1.txt",
             frozenset({"PERSONA_INJECTION", "POLICY_PROPOSAL", "CORRESPONDING_ACTION"}),
@@ -170,6 +171,9 @@ class LogprobExperimentRunner(BaseExperimentRunner):
         enforce_eager: bool = False,
         gpu_memory_utilization: float = 0.9,
         tensor_parallel_size: int = 1,
+        max_model_len: int | None = None,
+        max_num_seqs: int | None = None,
+        language_model_only: bool = False,
         llm_factory: Any = None,
         llm_interface: Any | None = None,
         show_progress: bool = True,
@@ -201,27 +205,39 @@ class LogprobExperimentRunner(BaseExperimentRunner):
             "enforce_eager": enforce_eager,
             "gpu_memory_utilization": gpu_memory_utilization,
             "tensor_parallel_size": tensor_parallel_size,
+            "max_model_len": max_model_len,
+            "max_num_seqs": max_num_seqs,
+            "language_model_only": language_model_only,
+            # This two-phase estimator requires visible, bounded analysis and
+            # strict Step-2 JSON. Qwen-style hidden thinking would violate both
+            # contracts, so disable it at the chat-template boundary.
+            "enable_thinking": False,
             "llm_interface": llm_interface,
             "show_progress": show_progress,
         }
         if llm_factory is not None:
             base_kwargs["llm_factory"] = llm_factory
         super().__init__(**base_kwargs)
-        self._continuation_scoring_preflight_backend: Any | None = None
+        self._bounded_scoring_preflight_backend: Any | None = None
 
-    def _preflight_continuation_scoring(self) -> Any:
-        """Initialize and validate continuation scoring once, before any chat call."""
+    def _preflight_bounded_scoring(self) -> Any:
+        """Initialize and validate bounded scoring once, before any chat call."""
 
         backend = self.initialize_llm()
-        if self._continuation_scoring_preflight_backend is backend:
+        if self._bounded_scoring_preflight_backend is backend:
             return backend
-        preflight = getattr(backend, "preflight_continuation_scoring", None)
+        if getattr(backend, "enable_thinking", None) is not False:
+            raise RuntimeError(
+                "logprob backend must declare enable_thinking=False so the "
+                "chat-template contract matches the checkpoint manifest"
+            )
+        preflight = getattr(backend, "preflight_bounded_scoring", None)
         if not callable(preflight):
             raise RuntimeError(
-                "logprob backend does not provide preflight_continuation_scoring()"
+                "logprob backend does not provide preflight_bounded_scoring()"
             )
         preflight()
-        self._continuation_scoring_preflight_backend = backend
+        self._bounded_scoring_preflight_backend = backend
         return backend
 
     def cleanup(self) -> None:
@@ -230,12 +246,16 @@ class LogprobExperimentRunner(BaseExperimentRunner):
         try:
             super().cleanup()
         finally:
-            self._continuation_scoring_preflight_backend = None
+            self._bounded_scoring_preflight_backend = None
 
     def _extra_manifest_config(self) -> Mapping[str, Any]:
         return {
             "binary_estimator": "bounded_single_token_candidate_set",
             "scoring_temperature": 0.0,
+            "thinking_mode": "disabled_via_chat_template",
+            "bounded_scoring_protocol": (
+                "completed_analysis_new_user_fresh_assistant_v1"
+            ),
         }
 
     def _apply_extra_manifest_config(self, config: Mapping[str, Any]) -> None:
@@ -243,6 +263,14 @@ class LogprobExperimentRunner(BaseExperimentRunner):
             raise ValueError("checkpoint has an incompatible binary estimator")
         if config.get("scoring_temperature") != 0.0:
             raise ValueError("checkpoint has an incompatible scoring temperature")
+        if config.get("thinking_mode") != "disabled_via_chat_template":
+            raise ValueError("checkpoint has an incompatible thinking-mode contract")
+        if config.get("bounded_scoring_protocol") != (
+            "completed_analysis_new_user_fresh_assistant_v1"
+        ):
+            raise ValueError("checkpoint has an incompatible bounded-scoring protocol")
+        if self.enable_thinking is not False:
+            raise ValueError("logprob checkpoints must disable chat-template thinking")
 
     def _apply_manifest_config(self, config: Mapping[str, Any]) -> None:
         super()._apply_manifest_config(config)
@@ -449,10 +477,7 @@ class LogprobExperimentRunner(BaseExperimentRunner):
                 raise TypeError(f"{stage} requires TreatmentAssignment values")
             if assignment.condition.kind == "no_information_retest":
                 template_stage = "step1" if stage == "step4a" else "step3"
-        return self._instantiate(
-            f"{template_stage}_phase2",
-            ANALYSIS_TEXT=analysis_text,
-        )
+        return self._instantiate(f"{template_stage}_phase2")
 
     @staticmethod
     def _simulated_consensus_missing(assignment: Assignment) -> bool:
@@ -467,6 +492,9 @@ class LogprobExperimentRunner(BaseExperimentRunner):
         """Validate the JSON-native bounded candidate score returned by the backend."""
 
         valid = response.get("valid")
+        finish_reason = response.get("finish_reason")
+        if finish_reason is not None and not isinstance(finish_reason, str):
+            raise TypeError("bounded-score finish_reason must be a string or null")
         if valid is False:
             error = response.get("error")
             sampled_token_id = response.get("sampled_token_id")
@@ -476,18 +504,18 @@ class LogprobExperimentRunner(BaseExperimentRunner):
                 or sampled_token_id < 0
             ):
                 raise TypeError(
-                    "invalid continuation sampled_token_id must be a non-negative "
+                    "invalid bounded score sampled_token_id must be a non-negative "
                     "integer or null"
                 )
             sampled_choice = response.get("sampled_choice")
             if sampled_choice not in {None, "Yes", "No"}:
                 raise ValueError(
-                    "invalid continuation sampled_choice must be Yes, No, or null"
+                    "invalid bounded score sampled_choice must be Yes, No, or null"
                 )
             format_valid = response.get("format_valid")
             if format_valid is not None and not isinstance(format_valid, bool):
                 raise TypeError(
-                    "invalid continuation format_valid must be a boolean or null"
+                    "invalid bounded score format_valid must be a boolean or null"
                 )
             if (
                 format_valid is None
@@ -496,12 +524,12 @@ class LogprobExperimentRunner(BaseExperimentRunner):
                 and format_valid != (sampled_choice in {"Yes", "No"})
             ):
                 raise ValueError(
-                    "invalid continuation format_valid must agree with sampled_choice"
+                    "invalid bounded score format_valid must agree with sampled_choice"
                 )
             candidates = response.get("candidates")
             if candidates is not None and not isinstance(candidates, list):
                 raise TypeError(
-                    "invalid continuation candidates must be a list or null"
+                    "invalid bounded score candidates must be a list or null"
                 )
             # Backend-declared INVALID diagnostics are still persisted. Ensure
             # they cannot defer a non-finite/non-JSON failure to write_chunk(),
@@ -511,22 +539,18 @@ class LogprobExperimentRunner(BaseExperimentRunner):
                 error if isinstance(error, str) and error else "invalid_logprob_score"
             )
         if valid is not True:
-            raise TypeError("continuation response valid must be a boolean")
+            raise TypeError("bounded-score response valid must be a boolean")
         if not isinstance(response.get("generated_text"), str):
             raise TypeError(
-                "valid continuation response generated_text must be a string"
+                "valid bounded-score response generated_text must be a string"
             )
-        finish_reason = response.get("finish_reason")
-        if finish_reason is not None and not isinstance(finish_reason, str):
-            raise TypeError("continuation finish_reason must be a string or null")
-
         probabilities = response.get("probabilities")
         if not isinstance(probabilities, Mapping) or set(probabilities) != {
             "Yes",
             "No",
         }:
             raise TypeError(
-                "valid continuation response must contain Yes/No probabilities"
+                "valid bounded-score response must contain Yes/No probabilities"
             )
         probability_values: list[float] = []
         for label in ("Yes", "No"):
@@ -560,7 +584,7 @@ class LogprobExperimentRunner(BaseExperimentRunner):
             "No",
         }:
             raise TypeError(
-                "valid continuation response must contain Yes/No label_logprobs"
+                "valid bounded-score response must contain Yes/No label_logprobs"
             )
         for value in label_logprobs.values():
             if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -569,7 +593,7 @@ class LogprobExperimentRunner(BaseExperimentRunner):
                 raise ValueError("label logprobs must be finite")
 
         if not isinstance(response.get("candidates"), list):
-            raise TypeError("continuation candidates must be a list")
+            raise TypeError("bounded-score candidates must be a list")
         sampled_token_id = response.get("sampled_token_id")
         if sampled_token_id is not None and (
             isinstance(sampled_token_id, bool) or not isinstance(sampled_token_id, int)
@@ -653,7 +677,7 @@ class LogprobExperimentRunner(BaseExperimentRunner):
                 )
 
         if executable:
-            backend = self._preflight_continuation_scoring()
+            backend = self._preflight_bounded_scoring()
             try:
                 responses = backend.chat(
                     dialogue_history=[item[2] for item in executable],
@@ -672,28 +696,40 @@ class LogprobExperimentRunner(BaseExperimentRunner):
                         f"backend returned {len(responses)} responses for {len(executable)} prompts"
                     )
             except Exception as exc:
-                for assignment, metadata, _ in executable:
+                raise RuntimeError(
+                    "Step 2 vLLM batch failed; the chunk was left incomplete and "
+                    "can be safely resumed after correcting the cause. A smaller "
+                    "--chunk-size may resolve batch-size or OOM failures"
+                ) from exc
+            for (assignment, metadata, _), response in zip(
+                executable, responses, strict=True
+            ):
+                try:
+                    text = self._response_text(response)
+                    finish_reason = response.get("finish_reason")
+                    if finish_reason is not None and not isinstance(finish_reason, str):
+                        raise TypeError("Step 2 finish_reason must be a string or null")
+                except (TypeError, ValueError) as exc:
                     records[assignment.sample_id] = self._error_record(
-                        assignment, metadata, "backend_execution_error", str(exc)
+                        assignment,
+                        metadata,
+                        "backend_response_schema_error",
+                        str(exc),
                     )
-            else:
-                for (assignment, metadata, _), response in zip(
-                    executable, responses, strict=True
-                ):
-                    try:
-                        text = self._response_text(response)
-                    except (TypeError, ValueError) as exc:
-                        records[assignment.sample_id] = self._error_record(
-                            assignment,
-                            metadata,
-                            "backend_response_schema_error",
-                            str(exc),
-                        )
-                        continue
-                    parsed = parse_percentage_response(text)
-                    records[assignment.sample_id] = make_record(
-                        "step2", metadata, parsed, sample_id=assignment.sample_id
+                    continue
+                if finish_reason is not None and finish_reason.casefold() == "length":
+                    records[assignment.sample_id] = self._invalid_record(
+                        assignment,
+                        metadata,
+                        "step2_truncated",
+                        "Step 2 reached its token limit before a complete JSON answer",
+                        raw_response=text,
                     )
+                    continue
+                parsed = parse_percentage_response(text)
+                records[assignment.sample_id] = make_record(
+                    "step2", metadata, parsed, sample_id=assignment.sample_id
+                )
 
         return [records[assignment.sample_id] for assignment in assignments]
 
@@ -730,7 +766,7 @@ class LogprobExperimentRunner(BaseExperimentRunner):
         if not phase1_inputs:
             return [records[assignment.sample_id] for assignment in assignments]
 
-        backend = self._preflight_continuation_scoring()
+        backend = self._preflight_bounded_scoring()
         try:
             phase1_responses = backend.chat(
                 dialogue_history=[item[3] for item in phase1_inputs],
@@ -750,11 +786,11 @@ class LogprobExperimentRunner(BaseExperimentRunner):
                     f"{len(phase1_inputs)} prompts"
                 )
         except Exception as exc:
-            for assignment, metadata, _, _ in phase1_inputs:
-                records[assignment.sample_id] = self._error_record(
-                    assignment, metadata, "phase1_backend_error", str(exc)
-                )
-            return [records[assignment.sample_id] for assignment in assignments]
+            raise RuntimeError(
+                f"{stage} phase-1 vLLM batch failed; the chunk was left incomplete "
+                "and can be safely resumed after correcting the cause. A smaller "
+                "--chunk-size may resolve batch-size or OOM failures"
+            ) from exc
 
         phase2_inputs: list[
             tuple[Assignment, dict[str, Any], str, list[dict[str, str]]]
@@ -777,7 +813,7 @@ class LogprobExperimentRunner(BaseExperimentRunner):
                     assignment,
                     metadata,
                     "phase1_truncated",
-                    "phase 1 reached its token limit; continuation was not attempted",
+                    "phase 1 reached its token limit; bounded scoring was not attempted",
                     raw_response=analysis_text,
                 )
                 continue
@@ -786,7 +822,7 @@ class LogprobExperimentRunner(BaseExperimentRunner):
                     assignment,
                     metadata,
                     "empty_analysis",
-                    "phase 1 returned no analysis; continuation was not attempted",
+                    "phase 1 returned no analysis; bounded scoring was not attempted",
                     raw_response=analysis_text,
                 )
                 continue
@@ -795,17 +831,17 @@ class LogprobExperimentRunner(BaseExperimentRunner):
                     assignment,
                     metadata,
                     "phase1_contains_final_answer",
-                    "phase 1 contained an explicit final Yes/No answer; continuation was not attempted",
+                    "phase 1 contained an explicit final Yes/No answer; bounded scoring was not attempted",
                     raw_response=analysis_text,
                 )
                 continue
             try:
-                continuation_prefix = self._render_phase2_prompt(
+                scoring_request = self._render_phase2_prompt(
                     stage, assignment, analysis_text
                 )
             except Exception as exc:
                 records[assignment.sample_id] = self._error_record(
-                    assignment, metadata, "continuation_prompt_error", str(exc)
+                    assignment, metadata, "scoring_prompt_error", str(exc)
                 )
                 continue
             phase2_inputs.append(
@@ -815,45 +851,40 @@ class LogprobExperimentRunner(BaseExperimentRunner):
                     analysis_text,
                     [
                         {"role": "user", "content": phase1_prompt},
-                        {"role": "assistant", "content": continuation_prefix},
+                        {"role": "assistant", "content": analysis_text},
+                        {"role": "user", "content": scoring_request},
                     ],
                 )
             )
 
         if phase2_inputs:
             try:
-                phase2_responses = backend.chat_with_continuation(
+                phase2_responses = backend.chat_with_bounded_candidates(
                     dialogue_history=[item[3] for item in phase2_inputs],
                     # Keep the scoring estimand invariant when phase-1 generation
                     # temperature changes. Candidate logprobs are always read from
-                    # an untempered continuation distribution.
+                    # an untempered fresh-assistant distribution.
                     temperature=0.0,
                     max_tokens=1,
                     seed=phase2_inputs[0][0].seed,
                     show_progress=self.show_progress,
-                    desc=f"{stage} phase 2: bounded Yes/No candidates",
+                    desc=f"{stage} phase 2: fresh-turn bounded Yes/No candidates",
                 )
                 if not isinstance(phase2_responses, Sequence) or isinstance(
                     phase2_responses, (str, bytes)
                 ):
-                    raise TypeError("continuation batch response must be a sequence")
+                    raise TypeError("bounded-score batch response must be a sequence")
                 if len(phase2_responses) != len(phase2_inputs):
                     raise RuntimeError(
                         f"backend returned {len(phase2_responses)} responses for "
-                        f"{len(phase2_inputs)} continuations"
+                        f"{len(phase2_inputs)} bounded-score requests"
                     )
             except Exception as exc:
-                for assignment, metadata, analysis_text, _ in phase2_inputs:
-                    records[assignment.sample_id] = self._error_record(
-                        assignment,
-                        metadata,
-                        "phase2_backend_error",
-                        str(exc),
-                        value={
-                            "analysis_text": analysis_text,
-                            "analysis_text_kind": "model_generated_visible_text",
-                        },
-                    )
+                raise RuntimeError(
+                    f"{stage} phase-2 vLLM batch failed; the chunk was left incomplete "
+                    "and can be safely resumed after correcting the cause. A smaller "
+                    "--chunk-size may resolve batch-size or OOM failures"
+                ) from exc
             else:
                 for (assignment, metadata, analysis_text, _), response in zip(
                     phase2_inputs, phase2_responses, strict=True
@@ -863,7 +894,7 @@ class LogprobExperimentRunner(BaseExperimentRunner):
                             assignment,
                             metadata,
                             "phase2_response_schema_error",
-                            "continuation response must be a mapping",
+                            "bounded-score response must be a mapping",
                             value={
                                 "analysis_text": analysis_text,
                                 "analysis_text_kind": "model_generated_visible_text",
@@ -1053,6 +1084,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gpu-memory-utilization", type=_unit_interval, default=0.9)
     parser.add_argument("--tensor-parallel-size", type=_positive_int, default=1)
     parser.add_argument(
+        "--max-model-len",
+        type=_positive_int,
+        help="Cap vLLM context length; must exceed --max-tokens",
+    )
+    parser.add_argument(
+        "--max-num-seqs",
+        type=_positive_int,
+        help="Cap the number of sequences scheduled concurrently by vLLM",
+    )
+    parser.add_argument(
+        "--language-model-only",
+        action="store_true",
+        help="Skip multimodal towers for text-only models such as Qwen3.5",
+    )
+    parser.add_argument(
         "--no-progress", action="store_true", help="Disable progress bars"
     )
     parser.add_argument(
@@ -1122,6 +1168,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             enforce_eager=args.enforce_eager,
             gpu_memory_utilization=args.gpu_memory_utilization,
             tensor_parallel_size=args.tensor_parallel_size,
+            max_model_len=args.max_model_len,
+            max_num_seqs=args.max_num_seqs,
+            language_model_only=args.language_model_only,
             show_progress=not args.no_progress,
         )
         if args.dry_run:
@@ -1167,7 +1216,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("Interrupted.", file=sys.stderr)
         return 130
     except Exception as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+        run_hint = ""
+        cause_hint = ""
+        if exc.__cause__ is not None:
+            cause_hint = (
+                f" Root cause: {type(exc.__cause__).__name__}: {exc.__cause__}."
+            )
+        if runner is not None and runner.active_manifest is not None:
+            run_hint = (
+                f" Checkpoint run ID: {runner.active_manifest.run_id}. "
+                "Resume it after correcting the failure if its frozen configuration "
+                "is still valid; otherwise start a new run."
+            )
+        print(f"Error: {exc}{cause_hint}{run_hint}", file=sys.stderr)
         return 1
     finally:
         if runner is not None:
