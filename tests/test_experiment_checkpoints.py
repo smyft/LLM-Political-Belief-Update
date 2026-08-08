@@ -20,6 +20,7 @@ from src.experiment.core import (
     canonical_json,
     sha256_text,
 )
+from src.models.binary_logprob import LOGPROB_NUMERIC_TOLERANCE
 
 
 _DEFAULT_VALUE = object()
@@ -276,6 +277,91 @@ class CheckpointStoreTests(unittest.TestCase):
                         {"sample": "s1-b"},
                         ResultStatus.VALID,
                         malformed,
+                    )
+                ],
+            )
+
+    def test_logprob_numeric_tolerance_accepts_clamped_boundary_mass(self):
+        logprob_manifest = manifest(pipeline="logprob")
+        logprob_store = CheckpointStore(Path(self.tempdir.name) / "boundary-logprob")
+        logprob_store.save_manifest(logprob_manifest)
+        overshoot = LOGPROB_NUMERIC_TOLERANCE / 2
+        raw_yes = 0.75
+        raw_no = 0.25 + overshoot
+        raw_mass = raw_yes + raw_no
+        value = logprob_value()
+        value["probabilities"] = {
+            "Yes": raw_yes / raw_mass,
+            "No": raw_no / raw_mass,
+        }
+        value["label_logprobs"] = {
+            "Yes": math.log(raw_yes),
+            "No": math.log(raw_no),
+        }
+        value["candidate_mass"] = 1.0
+        value["residual_mass"] = 0.0
+        value["candidates"][0].update(
+            logprob=math.log(raw_yes), probability=raw_yes
+        )
+        value["candidates"][1].update(logprob=math.log(raw_no), probability=raw_no)
+
+        logprob_store.write_chunk(
+            logprob_manifest,
+            "step1",
+            0,
+            [
+                ExperimentRecord(
+                    "s1-a",
+                    "step1",
+                    {"sample": "s1-a"},
+                    ResultStatus.VALID,
+                    value,
+                )
+            ],
+        )
+        loaded = logprob_store.load_stage(
+            logprob_manifest, "step1", require_complete=False
+        )
+        self.assertEqual(loaded["s1-a"].value["candidate_mass"], 1.0)
+
+    def test_logprob_numeric_tolerance_rejects_larger_mass_mismatch(self):
+        logprob_manifest = manifest(pipeline="logprob")
+        logprob_store = CheckpointStore(Path(self.tempdir.name) / "large-overshoot")
+        logprob_store.save_manifest(logprob_manifest)
+        overshoot = LOGPROB_NUMERIC_TOLERANCE * 2
+        raw_yes = 0.75
+        raw_no = 0.25 + overshoot
+        raw_mass = raw_yes + raw_no
+        value = logprob_value()
+        value["probabilities"] = {
+            "Yes": raw_yes / raw_mass,
+            "No": raw_no / raw_mass,
+        }
+        value["label_logprobs"] = {
+            "Yes": math.log(raw_yes),
+            "No": math.log(raw_no),
+        }
+        value["candidate_mass"] = 1.0
+        value["residual_mass"] = 0.0
+        value["candidates"][0].update(
+            logprob=math.log(raw_yes), probability=raw_yes
+        )
+        value["candidates"][1].update(logprob=math.log(raw_no), probability=raw_no)
+
+        with self.assertRaisesRegex(
+            CheckpointValidationError, "candidate_mass does not match candidates"
+        ):
+            logprob_store.write_chunk(
+                logprob_manifest,
+                "step1",
+                0,
+                [
+                    ExperimentRecord(
+                        "s1-a",
+                        "step1",
+                        {"sample": "s1-a"},
+                        ResultStatus.VALID,
+                        value,
                     )
                 ],
             )

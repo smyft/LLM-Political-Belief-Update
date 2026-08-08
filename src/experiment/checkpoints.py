@@ -20,6 +20,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
+from src.models.binary_logprob import LOGPROB_NUMERIC_TOLERANCE
+
 from .core import (
     ExperimentRecord,
     ResultStatus,
@@ -143,7 +145,10 @@ def validate_logprob_value(value: Any, *, sample_id: str) -> None:
         probabilities["No"], f"{prefix} No probability", minimum=0.0, maximum=1.0
     )
     if not math.isclose(
-        yes_probability + no_probability, 1.0, rel_tol=0.0, abs_tol=1e-9
+        yes_probability + no_probability,
+        1.0,
+        rel_tol=0.0,
+        abs_tol=LOGPROB_NUMERIC_TOLERANCE,
     ):
         raise CheckpointValidationError(f"{prefix} probabilities must sum to one")
 
@@ -164,7 +169,12 @@ def validate_logprob_value(value: Any, *, sample_id: str) -> None:
     residual_mass = _finite_number(
         value["residual_mass"], f"{prefix} residual_mass", minimum=0.0, maximum=1.0
     )
-    if not math.isclose(candidate_mass + residual_mass, 1.0, rel_tol=0.0, abs_tol=1e-9):
+    if not math.isclose(
+        candidate_mass + residual_mass,
+        1.0,
+        rel_tol=0.0,
+        abs_tol=LOGPROB_NUMERIC_TOLERANCE,
+    ):
         raise CheckpointValidationError(
             f"{prefix} candidate_mass and residual_mass must sum to one"
         )
@@ -207,7 +217,7 @@ def validate_logprob_value(value: Any, *, sample_id: str) -> None:
                 f"{candidate_prefix} decoded_token must be a string or null"
             )
         logprob = _finite_number(candidate["logprob"], f"{candidate_prefix} logprob")
-        if logprob > 1e-9:
+        if logprob > LOGPROB_NUMERIC_TOLERANCE:
             raise CheckpointValidationError(
                 f"{candidate_prefix} logprob cannot be positive"
             )
@@ -218,7 +228,10 @@ def validate_logprob_value(value: Any, *, sample_id: str) -> None:
             maximum=1.0,
         )
         if not math.isclose(
-            probability, math.exp(logprob), rel_tol=1e-9, abs_tol=1e-12
+            probability,
+            math.exp(logprob),
+            rel_tol=0.0,
+            abs_tol=LOGPROB_NUMERIC_TOLERANCE,
         ):
             raise CheckpointValidationError(
                 f"{candidate_prefix} probability does not match logprob"
@@ -231,15 +244,20 @@ def validate_logprob_value(value: Any, *, sample_id: str) -> None:
         raise CheckpointValidationError(f"{prefix} candidates must cover Yes and No")
     for choice, stored in (("Yes", yes_logprob), ("No", no_logprob)):
         calculated = _logsumexp(candidate_logprobs[choice])
-        if not math.isclose(calculated, stored, rel_tol=1e-9, abs_tol=1e-9):
+        if not math.isclose(
+            calculated,
+            stored,
+            rel_tol=0.0,
+            abs_tol=LOGPROB_NUMERIC_TOLERANCE,
+        ):
             raise CheckpointValidationError(
                 f"{prefix} {choice} label_logprob does not match candidates"
             )
     if not math.isclose(
         math.fsum(candidate_probabilities),
         candidate_mass,
-        rel_tol=1e-9,
-        abs_tol=1e-12,
+        rel_tol=0.0,
+        abs_tol=LOGPROB_NUMERIC_TOLERANCE,
     ):
         raise CheckpointValidationError(
             f"{prefix} candidate_mass does not match candidates"
@@ -248,9 +266,15 @@ def validate_logprob_value(value: Any, *, sample_id: str) -> None:
     total_logprob = _logsumexp((yes_logprob, no_logprob))
     expected_yes = math.exp(yes_logprob - total_logprob)
     if not math.isclose(
-        yes_probability, expected_yes, rel_tol=1e-9, abs_tol=1e-12
+        yes_probability,
+        expected_yes,
+        rel_tol=0.0,
+        abs_tol=LOGPROB_NUMERIC_TOLERANCE,
     ) or not math.isclose(
-        no_probability, 1.0 - expected_yes, rel_tol=1e-9, abs_tol=1e-12
+        no_probability,
+        1.0 - expected_yes,
+        rel_tol=0.0,
+        abs_tol=LOGPROB_NUMERIC_TOLERANCE,
     ):
         raise CheckpointValidationError(
             f"{prefix} conditional probabilities do not match label_logprobs"

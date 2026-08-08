@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from src.models.binary_logprob import (
+    LOGPROB_NUMERIC_TOLERANCE,
     MAX_CANDIDATE_TOKEN_IDS,
     build_yes_no_candidate_map,
     default_candidate_surfaces,
@@ -170,7 +171,59 @@ def test_impossible_candidate_mass_is_invalid_instead_of_clamped():
     assert result["probabilities"] is None
 
 
-def test_tiny_positive_rounding_overshoot_is_normalized_before_scoring():
+def test_candidate_mass_rounding_overshoot_within_tolerance_is_clamped():
+    overshoot = LOGPROB_NUMERIC_TOLERANCE / 2
+    result = score_yes_no_candidates(
+        {1: lp(math.log(0.75)), 2: lp(math.log(0.25 + overshoot))},
+        {1: "Yes", 2: "No"},
+        sampled_token_id=1,
+    )
+
+    assert result["valid"] is True
+    assert result["candidate_mass"] == 1.0
+    assert result["residual_mass"] == 0.0
+    assert result["probabilities"]["Yes"] == pytest.approx(
+        0.75 / (1.0 + overshoot)
+    )
+
+
+def test_candidate_mass_overshoot_beyond_tolerance_is_invalid():
+    overshoot = LOGPROB_NUMERIC_TOLERANCE * 2
+    result = score_yes_no_candidates(
+        {1: lp(math.log(0.75)), 2: lp(math.log(0.25 + overshoot))},
+        {1: "Yes", 2: "No"},
+        sampled_token_id=1,
+    )
+
+    assert result["valid"] is False
+    assert result["error"] == "candidate_mass_exceeds_one"
+
+
+def test_positive_logprob_within_tolerance_is_clamped_when_mass_is_plausible():
+    result = score_yes_no_candidates(
+        {
+            1: lp(LOGPROB_NUMERIC_TOLERANCE / 2),
+            2: lp(math.log(LOGPROB_NUMERIC_TOLERANCE / 4)),
+        },
+        {1: "Yes", 2: "No"},
+    )
+
+    assert result["valid"] is True
+    assert result["candidates"][0]["logprob"] == 0.0
+    assert result["candidate_mass"] == 1.0
+
+
+def test_positive_logprob_beyond_tolerance_is_invalid():
+    result = score_yes_no_candidates(
+        {1: lp(LOGPROB_NUMERIC_TOLERANCE * 2), 2: lp(-2.0)},
+        {1: "Yes", 2: "No"},
+    )
+
+    assert result["valid"] is False
+    assert result["error"] == "positive_candidate_logprob:1"
+
+
+def test_clamped_positive_logprob_does_not_hide_impossible_total_mass():
     result = score_yes_no_candidates(
         {1: lp(1e-12), 2: lp(-2.0)},
         {1: "Yes", 2: "No"},

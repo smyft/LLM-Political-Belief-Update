@@ -20,6 +20,11 @@ from typing import Any, Literal, TypeAlias
 
 BinaryChoice: TypeAlias = Literal["Yes", "No"]
 
+# vLLM may return logprobs derived from reduced-precision model logits.  Use one
+# absolute tolerance throughout scoring and checkpoint validation so a score
+# accepted here cannot later be rejected solely by a stricter persistence rule.
+LOGPROB_NUMERIC_TOLERANCE = 1e-6
+
 # vLLM 0.24 caps SamplingParams.logprob_token_ids at 128.  The default
 # surface-form Cartesian product below has 120 entries before token-id
 # deduplication, so it is bounded independently of tokenizer vocabulary size.
@@ -144,7 +149,9 @@ def build_yes_no_candidate_map(
 
 def _logsumexp(values: Sequence[float]) -> float:
     maximum = max(values)
-    return maximum + math.log(sum(math.exp(value - maximum) for value in values))
+    return maximum + math.log(
+        math.fsum(math.exp(value - maximum) for value in values)
+    )
 
 
 def _invalid_result(
@@ -263,7 +270,7 @@ def score_yes_no_candidates(
         # A log probability cannot be meaningfully positive.  Permit only a
         # tiny floating-point overshoot and normalize that overshoot to zero
         # before exponentiation so malformed backend values cannot overflow.
-        if logprob > 1e-9:
+        if logprob > LOGPROB_NUMERIC_TOLERANCE:
             return _invalid_result(
                 f"positive_candidate_logprob:{token_id}",
                 sampled_token_id=sampled_token_id,
@@ -295,7 +302,7 @@ def score_yes_no_candidates(
     # Log probabilities should describe a normalized vocabulary distribution.
     # Permit tiny floating-point overshoot, but reject substantively impossible
     # mass rather than silently concealing malformed backend data.
-    if candidate_mass > 1.0 + 1e-9:
+    if candidate_mass > 1.0 + LOGPROB_NUMERIC_TOLERANCE:
         return _invalid_result(
             "candidate_mass_exceeds_one",
             sampled_token_id=sampled_token_id,
@@ -326,6 +333,7 @@ def score_yes_no_candidates(
 
 __all__ = [
     "BinaryChoice",
+    "LOGPROB_NUMERIC_TOLERANCE",
     "MAX_CANDIDATE_TOKEN_IDS",
     "build_yes_no_candidate_map",
     "default_candidate_surfaces",

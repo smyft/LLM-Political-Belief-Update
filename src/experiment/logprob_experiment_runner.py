@@ -46,6 +46,7 @@ from src.experiment.planning import (
     TreatmentAssignment,
     format_presented_percentage,
 )
+from src.models.binary_logprob import LOGPROB_NUMERIC_TOLERANCE
 
 
 _BINARY_STAGES = frozenset({"step1", "step3", "step4a", "step4b"})
@@ -256,6 +257,7 @@ class LogprobExperimentRunner(BaseExperimentRunner):
             "bounded_scoring_protocol": (
                 "completed_analysis_new_user_fresh_assistant_v1"
             ),
+            "bounded_scoring_numeric_tolerance": LOGPROB_NUMERIC_TOLERANCE,
         }
 
     def _apply_extra_manifest_config(self, config: Mapping[str, Any]) -> None:
@@ -269,6 +271,13 @@ class LogprobExperimentRunner(BaseExperimentRunner):
             "completed_analysis_new_user_fresh_assistant_v1"
         ):
             raise ValueError("checkpoint has an incompatible bounded-scoring protocol")
+        if (
+            config.get("bounded_scoring_numeric_tolerance")
+            != LOGPROB_NUMERIC_TOLERANCE
+        ):
+            raise ValueError(
+                "checkpoint has an incompatible bounded-scoring numeric tolerance"
+            )
         if self.enable_thinking is not False:
             raise ValueError("logprob checkpoints must disable chat-template thinking")
 
@@ -563,7 +572,12 @@ class LogprobExperimentRunner(BaseExperimentRunner):
                     f"{label} probability must be finite and between 0 and 1"
                 )
             probability_values.append(number)
-        if not math.isclose(sum(probability_values), 1.0, abs_tol=1e-9):
+        if not math.isclose(
+            sum(probability_values),
+            1.0,
+            rel_tol=0.0,
+            abs_tol=LOGPROB_NUMERIC_TOLERANCE,
+        ):
             raise ValueError("Yes/No probabilities must sum to one")
 
         masses: list[float] = []
@@ -575,7 +589,12 @@ class LogprobExperimentRunner(BaseExperimentRunner):
             if not math.isfinite(number) or not 0.0 <= number <= 1.0:
                 raise ValueError(f"{field} must be finite and between 0 and 1")
             masses.append(number)
-        if not math.isclose(sum(masses), 1.0, abs_tol=1e-9):
+        if not math.isclose(
+            sum(masses),
+            1.0,
+            rel_tol=0.0,
+            abs_tol=LOGPROB_NUMERIC_TOLERANCE,
+        ):
             raise ValueError("candidate_mass and residual_mass must sum to one")
 
         label_logprobs = response.get("label_logprobs")

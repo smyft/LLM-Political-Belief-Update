@@ -17,6 +17,7 @@ from src.experiment.planning import (
     TreatmentAssignment,
     TreatmentCondition,
 )
+from src.models.binary_logprob import LOGPROB_NUMERIC_TOLERANCE
 
 
 class FakeBackend:
@@ -716,6 +717,7 @@ def test_logprob_pipeline_rejects_api_and_estimates_two_phase_sequences():
         "scoring_temperature": 0.0,
         "thinking_mode": "disabled_via_chat_template",
         "bounded_scoring_protocol": ("completed_analysis_new_user_fresh_assistant_v1"),
+        "bounded_scoring_numeric_tolerance": LOGPROB_NUMERIC_TOLERANCE,
     }
 
 
@@ -733,6 +735,16 @@ def test_logprob_checkpoint_requires_fresh_turn_scoring_contract():
     incompatible = dict(config)
     incompatible["bounded_scoring_protocol"] = "assistant_reasoning_content"
     with pytest.raises(ValueError, match="bounded-scoring protocol"):
+        runner._apply_extra_manifest_config(incompatible)
+
+    incompatible = dict(config)
+    incompatible.pop("bounded_scoring_numeric_tolerance")
+    with pytest.raises(ValueError, match="numeric tolerance"):
+        runner._apply_extra_manifest_config(incompatible)
+
+    incompatible = dict(config)
+    incompatible["bounded_scoring_numeric_tolerance"] = 1e-9
+    with pytest.raises(ValueError, match="numeric tolerance"):
         runner._apply_extra_manifest_config(incompatible)
 
 

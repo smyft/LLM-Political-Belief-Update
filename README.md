@@ -104,6 +104,8 @@ The tokenizer is used to discover supported single-token Yes/No spellings. Multi
 
 Reported `probabilities.Yes` and `probabilities.No` are conditional on that candidate set. Each valid score also reports `candidate_mass`, `residual_mass`, candidate token scores, `sampled_choice`, and `format_valid`.
 
+Finite-precision candidate-mass overshoot up to the manifest-recorded absolute tolerance of `1e-6` is treated as a numeric boundary effect and clamped to one. Larger overshoot remains `INVALID`; the scorer and checkpoint validator use the same tolerance.
+
 A missing candidate score, an unsupported sampled token, or truncated Phase 1 analysis is recorded as `INVALID`; malformed backend responses are recorded as `ERROR`. The code never substitutes `0.5/0.5` for an invalid observation.
 
 ## Data
